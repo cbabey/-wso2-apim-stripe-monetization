@@ -34,6 +34,7 @@ import MuiDialogTitle from '@mui/material/DialogTitle';
 import Box from '@mui/material/Box';
 import Paper from '@mui/material/Paper';
 import InputBase from '@mui/material/InputBase';
+import CircularProgress from '@mui/material/CircularProgress';
 import HighlightOffIcon from '@mui/icons-material/HighlightOff';
 import SearchIcon from '@mui/icons-material/Search';
 import { FormattedMessage, injectIntl } from 'react-intl';
@@ -578,15 +579,80 @@ class Subscriptions extends React.Component {
         }
 
         const {
-            subscriptions, apisNotFound, subscriptionsNotFound,
+            subscriptions, apisNotFound, subscriptionsNotFound, stripeSessionCompleting,
         } = this.state;
         const { applicationId } = this.props.application;
         const { intl } = this.props;
+
+        // Stripe completion loading screen — shown while subscriptions are still
+        // fetching AND a Stripe session is being activated in the background.
+        if (!subscriptions && stripeSessionCompleting) {
+            return (
+                <Root>
+                    <Box
+                        sx={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            minHeight: 240,
+                            gap: 3,
+                        }}
+                    >
+                        <CircularProgress size={48} thickness={4} />
+                        <Typography variant='h6' color='textSecondary'>
+                            <FormattedMessage
+                                id='Applications.Details.Subscriptions.stripe.activating.title'
+                                defaultMessage='Activating your subscription&hellip;'
+                            />
+                        </Typography>
+                        <Typography variant='body2' color='textSecondary'>
+                            <FormattedMessage
+                                id='Applications.Details.Subscriptions.stripe.activating.subtitle'
+                                defaultMessage='Please wait while we confirm your payment and set up access.'
+                            />
+                        </Typography>
+                    </Box>
+                </Root>
+            );
+        }
 
         if (subscriptions) {
             return (
                 <Root>
                     <Box className={classes.root}>
+                        {/* Stripe session completion banner — visible while the complete-session
+                            call is in flight after the user returns from Stripe Checkout */}
+                        {stripeSessionCompleting && (
+                            <Box
+                                sx={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: 2,
+                                    padding: '12px 16px',
+                                    marginBottom: 2,
+                                    borderRadius: 1,
+                                    backgroundColor: 'info.light',
+                                    color: 'info.contrastText',
+                                }}
+                            >
+                                <CircularProgress size={20} thickness={5} color='inherit' />
+                                <Box>
+                                    <Typography variant='body1' sx={{ fontWeight: 500 }}>
+                                        <FormattedMessage
+                                            id='Applications.Details.Subscriptions.stripe.banner.title'
+                                            defaultMessage='Confirming your payment&hellip;'
+                                        />
+                                    </Typography>
+                                    <Typography variant='body2'>
+                                        <FormattedMessage
+                                            id='Applications.Details.Subscriptions.stripe.banner.subtitle'
+                                            defaultMessage='Activating your subscription — this usually takes a moment.'
+                                        />
+                                    </Typography>
+                                </Box>
+                            </Box>
+                        )}
                         <Box className={classes.titleWrapper}>
                             <Typography
                                 variant='h5'
