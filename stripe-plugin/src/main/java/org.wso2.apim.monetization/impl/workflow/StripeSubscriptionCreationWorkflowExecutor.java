@@ -480,10 +480,18 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                     "for StripeSubscriptionCreationWorkflowExecutor");
         }
         try {
+            // Build the success URL so it lands directly on the application's subscriptions tab.
+            // checkoutSuccessUrl is expected to be the base applications URL
+            // (e.g. https://host:9443/devportal/applications).
+            // We append /{applicationId}/subscriptions so Subscriptions.jsx mounts and
+            // detects the returned ?session_id= query param to trigger browser-side completion.
+            String successUrl = checkoutSuccessUrl
+                    + "/" + subWorkFlowDTO.getApplicationId()
+                    + "/subscriptions?session_id={CHECKOUT_SESSION_ID}";
+
             SessionCreateParams.Builder paramsBuilder = SessionCreateParams.builder()
                     .setMode(SessionCreateParams.Mode.SETUP)
-                    // {CHECKOUT_SESSION_ID} is a Stripe template variable replaced at redirect time
-                    .setSuccessUrl(checkoutSuccessUrl + "?session_id={CHECKOUT_SESSION_ID}")
+                    .setSuccessUrl(successUrl)
                     .setCancelUrl(checkoutCancelUrl)
                     // currency is required by newer Stripe API versions for setup mode sessions
                     .setCurrency(currency)
