@@ -158,6 +158,7 @@ public class StripeMonetizationConstants {
 
     // Stripe Checkout Session — DB status values
     public static final String CHECKOUT_SESSION_STATUS_PENDING = "PENDING";
+    public static final String CHECKOUT_SESSION_STATUS_IN_PROGRESS = "IN_PROGRESS";
     public static final String CHECKOUT_SESSION_STATUS_COMPLETED = "COMPLETED";
     public static final String CHECKOUT_SESSION_STATUS_EXPIRED = "EXPIRED";
 
@@ -186,6 +187,18 @@ public class StripeMonetizationConstants {
     public static final String UPDATE_CHECKOUT_SESSION_STATUS_SQL =
             "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = ?, COMPLETED_TIME = ? " +
             "WHERE SESSION_ID = ?";
+
+    // Idempotency guard: atomically transition PENDING → IN_PROGRESS so only one
+    // completion path (webhook vs browser-redirect) processes the session.
+    // Returns rowsAffected = 1 on success, 0 if already claimed/completed.
+    public static final String CLAIM_CHECKOUT_SESSION_SQL =
+            "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'IN_PROGRESS' " +
+            "WHERE SESSION_ID = ? AND STATUS = 'PENDING'";
+
+    // Reset IN_PROGRESS → PENDING when completion fails, allowing a retry by the other path.
+    public static final String RESET_CHECKOUT_SESSION_CLAIM_SQL =
+            "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'PENDING' " +
+            "WHERE SESSION_ID = ? AND STATUS = 'IN_PROGRESS'";
 
     public static final String GET_CHECKOUT_URL_BY_WORKFLOW_REF_SQL =
             "SELECT CHECKOUT_URL FROM AM_STRIPE_CHECKOUT_SESSIONS " +

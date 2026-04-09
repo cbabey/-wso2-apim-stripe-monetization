@@ -728,7 +728,33 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
         String checkoutSessionId = workflowDTO.getAttributes().get(
                 StripeMonetizationConstants.CHECKOUT_SESSION_ID_ATTRIBUTE);
         if (!StringUtils.isBlank(checkoutSessionId)) {
-            completeStripeCheckoutSubscription(workflowDTO, checkoutSessionId);
+            // Idempotency guard: atomically claim the session (PENDING → IN_PROGRESS).
+            // Both the Stripe webhook path and the browser-redirect path call complete()
+            // concurrently. Only the one that wins the DB claim proceeds with Stripe work;
+            // the other sees false and skips to the standard DB update below.
+            boolean claimed;
+            try {
+                claimed = stripeMonetizationDAO.claimCheckoutSession(checkoutSessionId);
+            } catch (StripeMonetizationException e) {
+                throw new WorkflowException("Failed to claim checkout session: " + checkoutSessionId, e);
+            }
+            if (claimed) {
+                try {
+                    completeStripeCheckoutSubscription(workflowDTO, checkoutSessionId);
+                } catch (WorkflowException e) {
+                    // Reset the claim so the other path (webhook or browser-redirect) can retry.
+                    try {
+                        stripeMonetizationDAO.resetCheckoutSessionClaim(checkoutSessionId);
+                    } catch (StripeMonetizationException resetEx) {
+                        log.error("Failed to reset claim for session " + checkoutSessionId
+                                + " after completion error", resetEx);
+                    }
+                    throw e;
+                }
+            } else {
+                log.info("Stripe checkout session " + checkoutSessionId
+                        + " already claimed or completed — skipping Stripe work in this path");
+            }
         }
 
         // ── Standard workflow DB update ──────────────────────────────────────

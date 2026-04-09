@@ -219,6 +219,7 @@ class Subscriptions extends React.Component {
             openDialog: false,
             searchText: '',
             pseudoSubscriptions: false,
+            stripeSessionCompleting: false,
         };
         this.checkSubValidationDisabled = this.checkSubValidationDisabled.bind(this);
         this.handleSubscriptionDelete = this.handleSubscriptionDelete.bind(this);
@@ -230,6 +231,7 @@ class Subscriptions extends React.Component {
         this.handleSearchTextTmpChange = this.handleSearchTextTmpChange.bind(this);
         this.handleClearSearch = this.handleClearSearch.bind(this);
         this.handleEnterPress = this.handleEnterPress.bind(this);
+        this.handleStripeSessionCompletion = this.handleStripeSessionCompletion.bind(this);
         this.searchTextTmp = '';
     }
 
@@ -241,6 +243,61 @@ class Subscriptions extends React.Component {
     componentDidMount() {
         const { applicationId } = this.props.application;
         this.updateSubscriptions(applicationId);
+
+        // Browser-redirect Stripe completion path.
+        // After Stripe Checkout the user is redirected back to checkoutSuccessUrl with
+        // ?session_id=cs_xxx appended. If this component mounts with that parameter,
+        // call the complete-session endpoint to activate the subscription — running in
+        // parallel with the Stripe webhook, with a first-one-wins idempotency guard.
+        const searchParams = new URLSearchParams(window.location.search);
+        const sessionId = searchParams.get('session_id');
+        if (sessionId && sessionId.startsWith('cs_')) {
+            this.handleStripeSessionCompletion(sessionId);
+        }
+    }
+
+    /**
+     * Calls the complete-session endpoint after the user returns from Stripe Checkout.
+     * On success the subscription list is refreshed to show the newly active subscription.
+     *
+     * @param {string} sessionId Stripe Checkout session ID (cs_xxxx)
+     * @memberof Subscriptions
+     */
+    handleStripeSessionCompletion(sessionId) {
+        const { intl } = this.props;
+        this.setState({ stripeSessionCompleting: true });
+
+        fetch(`/api/am/stripe/complete-session?session_id=${encodeURIComponent(sessionId)}`, {
+            method: 'POST',
+        })
+            .then((res) => {
+                // Remove session_id from URL so a page refresh does not re-trigger this flow
+                window.history.replaceState({}, document.title, window.location.pathname);
+                if (res.ok) {
+                    const { applicationId } = this.props.application;
+                    this.updateSubscriptions(applicationId);
+                    Alert.info(intl.formatMessage({
+                        id: 'Applications.Details.Subscriptions.stripe.payment.confirmed',
+                        defaultMessage: 'Payment confirmed! Your subscription is now active.',
+                    }));
+                } else {
+                    Alert.error(intl.formatMessage({
+                        id: 'Applications.Details.Subscriptions.stripe.activation.error',
+                        defaultMessage: 'Your payment was received but subscription activation encountered an error.'
+                            + ' Please contact support.',
+                    }));
+                }
+            })
+            .catch(() => {
+                window.history.replaceState({}, document.title, window.location.pathname);
+                Alert.error(intl.formatMessage({
+                    id: 'Applications.Details.Subscriptions.stripe.network.error',
+                    defaultMessage: 'Could not reach the server to activate your subscription. Please try again.',
+                }));
+            })
+            .finally(() => {
+                this.setState({ stripeSessionCompleting: false });
+            });
     }
 
     handleOpenDialog() {

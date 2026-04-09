@@ -943,6 +943,84 @@ public class StripeMonetizationDAO {
     }
 
     /**
+     * Atomically claims a Stripe Checkout Session for processing by transitioning its
+     * status from {@code PENDING} to {@code IN_PROGRESS}.
+     *
+     * <p>This is the idempotency guard for the first-one-wins parallel completion strategy.
+     * Both the webhook path and the browser-redirect path call {@code complete()} on the
+     * workflow executor, which calls this method first. Only the winner (rowsAffected == 1)
+     * proceeds with Stripe API calls; the other sees 0 rows and skips.
+     *
+     * @param sessionId Stripe checkout session ID (cs_xxxx)
+     * @return {@code true} if the claim succeeded (this caller should process the session);
+     *         {@code false} if the session was already claimed or completed
+     * @throws StripeMonetizationException if a database error occurs
+     */
+    public boolean claimCheckoutSession(String sessionId) throws StripeMonetizationException {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            conn.setAutoCommit(false);
+            ps = conn.prepareStatement(StripeMonetizationConstants.CLAIM_CHECKOUT_SESSION_SQL);
+            ps.setString(1, sessionId);
+            int rowsAffected = ps.executeUpdate();
+            conn.commit();
+            return rowsAffected == 1;
+        } catch (SQLException e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ex) {
+                    log.error("Error rolling back claimCheckoutSession for session: " + sessionId, ex);
+                }
+            }
+            String errorMessage = "Failed to claim Stripe checkout session: " + sessionId;
+            log.error(errorMessage, e);
+            throw new StripeMonetizationException(errorMessage, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, null);
+        }
+    }
+
+    /**
+     * Resets a claimed Stripe Checkout Session from {@code IN_PROGRESS} back to {@code PENDING}.
+     *
+     * <p>Called when {@code completeStripeCheckoutSubscription()} throws an exception so
+     * that the other completion path (webhook or browser-redirect) can retry the session.
+     *
+     * @param sessionId Stripe checkout session ID (cs_xxxx)
+     * @throws StripeMonetizationException if a database error occurs
+     */
+    public void resetCheckoutSessionClaim(String sessionId) throws StripeMonetizationException {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            conn.setAutoCommit(false);
+            ps = conn.prepareStatement(StripeMonetizationConstants.RESET_CHECKOUT_SESSION_CLAIM_SQL);
+            ps.setString(1, sessionId);
+            ps.executeUpdate();
+            conn.commit();
+        } catch (SQLException e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ex) {
+                    log.error("Error rolling back resetCheckoutSessionClaim for session: " + sessionId, ex);
+                }
+            }
+            String errorMessage = "Failed to reset claim for Stripe checkout session: " + sessionId;
+            log.error(errorMessage, e);
+            throw new StripeMonetizationException(errorMessage, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, null);
+        }
+    }
+
+    /**
      * Update the status of a Stripe Checkout Session record
      *
      * @param sessionId Stripe checkout session ID (cs_xxxx)
