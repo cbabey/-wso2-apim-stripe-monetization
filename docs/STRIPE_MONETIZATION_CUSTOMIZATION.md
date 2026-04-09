@@ -157,7 +157,153 @@ sequenceDiagram
 
 ### 2.2 Solution Architecture
 
-The full flow spans three phases with **two parallel completion paths** in Phase 3.
+The full flow spans three phases. After the subscriber enters their card on Stripe, the workflow can be completed via **two independent paths**. The diagrams below show each path in isolation, followed by the combined view showing how both run in parallel with a first-one-wins guard.
+
+---
+
+#### 2.2.1 Path A — Browser-Redirect Completion Only
+
+This path is triggered when the subscriber's browser is redirected back to DevPortal after card entry. `Subscriptions.jsx` detects the `?session_id=` query parameter and calls the `/complete-session` endpoint to activate the subscription.
+
+> This diagram shows the full end-to-end flow assuming only the browser-redirect path is used (no webhook involvement).
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    actor User as Subscriber (Browser)
+    participant DP  as DevPortal UI<br/>(Subscriptions.jsx)
+    participant API as Store REST API<br/>POST /subscriptions
+    participant PLG as Stripe Plugin<br/>(dropins JAR)
+    participant DB  as APIM Database
+    participant PA  as Stripe<br/>Platform Account
+    participant SC  as Stripe Checkout<br/>(Hosted Page)
+    participant CS  as /complete-session<br/>endpoint
+    participant CA  as Stripe<br/>Connected Account
+
+    rect rgb(230, 245, 255)
+        Note over User,PA: Phase 1 — Subscribe & Redirect
+        User  ->>  DP  : Click "Subscribe to API"
+        DP    ->>  API : POST /subscriptions<br/>{apiId, applicationId, tier}
+        API   ->>  PLG : monetizeSubscription(workflowDTO, api)
+        PLG   ->>  DB  : getApplicationUUID(applicationId)<br/>→ AM_APPLICATION.UUID
+        PLG   ->>  PA  : Session.create()<br/>mode=SETUP, currency, metadata<br/>successUrl = .../applications/{appUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}
+        PA    -->> PLG : {sessionId, checkoutUrl}
+        PLG   ->>  DB  : Save session (STATUS=PENDING)
+        PLG   ->>  DB  : Set workflow STATUS=CREATED
+        PLG   -->> API : HttpWorkflowResponse {redirectUrl}
+        API   -->> DP  : {status: ON_HOLD,<br/>redirectionParams: {redirectUrl: "https://checkout.stripe.com/..."}}
+        DP    ->>  SC  : window.location.href = redirectUrl
+    end
+
+    rect rgb(255, 245, 220)
+        Note over User,SC: Phase 2 — Card Entry on Stripe
+        User  ->>  SC  : Enter card details & confirm
+        SC    -->> User: Confirmation screen
+    end
+
+    rect rgb(230, 255, 235)
+        Note over SC,CA: Phase 3 — Browser-Redirect Completion
+        SC    ->>  User : Redirect → .../applications/{appUUID}/subscriptions?session_id=cs_xxx
+        User  ->>  DP   : Page loads — Subscriptions.jsx mounts
+        DP    ->>  DP   : componentDidMount: detects ?session_id<br/>→ stripeSessionCompleting=true → show loading UI
+        DP    ->>  CS   : POST /api/am/stripe/complete-session?session_id=cs_xxx
+        CS    ->>  DB   : SELECT WORKFLOW_REFERENCE, STATUS<br/>WHERE SESSION_ID=cs_xxx
+        DB    -->> CS   : workflowRef, STATUS=PENDING
+        CS    ->>  PLG  : complete(workflowDTO)<br/>attributes[checkoutSessionId]=cs_xxx
+        PLG   ->>  DB   : UPDATE STATUS PENDING→IN_PROGRESS (claim)
+        PLG   ->>  PA   : Session.retrieve → SetupIntent → paymentMethodId
+        PLG   ->>  PA   : Customer.create(pm, invoice_settings.default_pm)
+        PA    -->> PLG  : Platform Customer {id}
+        PLG   ->>  DB   : Save platform customer
+        PLG   ->>  CA   : PaymentMethod.create(clone from platform)
+        PLG   ->>  CA   : Customer.create(cloned_pm, invoice_settings.default_pm)
+        CA    -->> PLG  : Shared Customer {id}
+        PLG   ->>  DB   : Save shared customer
+        PLG   ->>  CA   : Subscription.create(shared_customer_id, plan_id)
+        CA    -->> PLG  : Subscription {id}
+        PLG   ->>  DB   : Save subscription
+        PLG   ->>  DB   : Mark session=COMPLETED, subscription=UNBLOCKED
+        CS    -->> DP   : HTTP 200 {status: completed}
+        DP    ->>  DP   : stripeSessionCompleting=false<br/>Clear ?session_id from URL<br/>Refresh subscription list<br/>Alert: "Payment confirmed!"
+    end
+```
+
+---
+
+#### 2.2.2 Path B — Webhook Completion Only
+
+This path is triggered when Stripe fires a `checkout.session.completed` event to the registered webhook endpoint. The webhook verifies the HMAC-SHA256 signature, looks up the workflow reference, and calls `WorkflowExecutor.complete()` to activate the subscription server-side — independent of the browser.
+
+> This diagram shows the full end-to-end flow assuming only the webhook path is used (no browser-redirect involvement).
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    actor User as Subscriber (Browser)
+    participant DP  as DevPortal UI
+    participant API as Store REST API<br/>POST /subscriptions
+    participant PLG as Stripe Plugin<br/>(dropins JAR)
+    participant DB  as APIM Database
+    participant PA  as Stripe<br/>Platform Account
+    participant SC  as Stripe Checkout<br/>(Hosted Page)
+    participant WH  as /webhook<br/>endpoint
+    participant CA  as Stripe<br/>Connected Account
+
+    rect rgb(230, 245, 255)
+        Note over User,PA: Phase 1 — Subscribe & Redirect
+        User  ->>  DP  : Click "Subscribe to API"
+        DP    ->>  API : POST /subscriptions<br/>{apiId, applicationId, tier}
+        API   ->>  PLG : monetizeSubscription(workflowDTO, api)
+        PLG   ->>  DB  : getApplicationUUID(applicationId)<br/>→ AM_APPLICATION.UUID
+        PLG   ->>  PA  : Session.create()<br/>mode=SETUP, currency, metadata<br/>successUrl = .../applications/{appUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}
+        PA    -->> PLG : {sessionId, checkoutUrl}
+        PLG   ->>  DB  : Save session (STATUS=PENDING)
+        PLG   ->>  DB  : Set workflow STATUS=CREATED
+        PLG   -->> API : HttpWorkflowResponse {redirectUrl}
+        API   -->> DP  : {status: ON_HOLD,<br/>redirectionParams: {redirectUrl: "https://checkout.stripe.com/..."}}
+        DP    ->>  SC  : window.location.href = redirectUrl
+    end
+
+    rect rgb(255, 245, 220)
+        Note over User,SC: Phase 2 — Card Entry on Stripe
+        User  ->>  SC  : Enter card details & confirm
+        SC    -->> User: Confirmation screen
+    end
+
+    rect rgb(230, 255, 235)
+        Note over SC,CA: Phase 3 — Webhook Completion (server-side)
+        SC    ->>  WH  : POST /api/am/stripe/webhook<br/>Stripe-Signature: t=...,v1=...
+        WH    ->>  WH  : Verify HMAC-SHA256 signature<br/>(timestamp window check + MAC compare)
+        WH    ->>  WH  : Parse JSON → checkout.session.completed event
+        WH    ->>  DB  : SELECT WORKFLOW_REFERENCE<br/>WHERE SESSION_ID=cs_xxx
+        DB    -->> WH  : workflowRef
+        WH    ->>  DB  : retrieveWorkflowFromInternalReference(workflowRef)
+        DB    -->> WH  : WorkflowDTO
+        WH    ->>  PLG : complete(workflowDTO)<br/>attributes[checkoutSessionId]=cs_xxx
+        PLG   ->>  DB  : UPDATE STATUS PENDING→IN_PROGRESS (claim)
+        PLG   ->>  PA  : Session.retrieve → SetupIntent → paymentMethodId
+        PLG   ->>  PA  : Customer.create(pm, invoice_settings.default_pm)
+        PA    -->> PLG : Platform Customer {id}
+        PLG   ->>  DB  : Save platform customer
+        PLG   ->>  CA  : PaymentMethod.create(clone from platform)
+        PLG   ->>  CA  : Customer.create(cloned_pm, invoice_settings.default_pm)
+        CA    -->> PLG : Shared Customer {id}
+        PLG   ->>  DB  : Save shared customer
+        PLG   ->>  CA  : Subscription.create(shared_customer_id, plan_id)
+        CA    -->> PLG : Subscription {id}
+        PLG   ->>  DB  : Save subscription
+        PLG   ->>  DB  : Mark session=COMPLETED, subscription=UNBLOCKED
+        WH    -->> SC  : HTTP 200 {received: true}<br/>(Stripe stops retrying)
+    end
+```
+
+---
+
+#### 2.2.3 Combined — Both Paths Running in Parallel (First-One-Wins)
+
+In production, **both Phase 3 paths fire simultaneously** — Stripe delivers the webhook event at the same time the browser redirect lands. The first path to atomically claim the checkout session (`PENDING → IN_PROGRESS`) wins and performs all Stripe API work. The losing path detects `rowsAffected = 0` and skips Stripe work, proceeding only to update the APIM workflow database.
 
 ```mermaid
 sequenceDiagram
