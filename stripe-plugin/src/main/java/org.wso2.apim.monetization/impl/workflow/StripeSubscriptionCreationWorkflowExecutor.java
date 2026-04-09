@@ -483,10 +483,14 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
             // Build the success URL so it lands directly on the application's subscriptions tab.
             // checkoutSuccessUrl is expected to be the base applications URL
             // (e.g. https://host:9443/devportal/applications).
-            // We append /{applicationId}/subscriptions so Subscriptions.jsx mounts and
-            // detects the returned ?session_id= query param to trigger browser-side completion.
+            // DevPortal routes use the application UUID, not the numeric DB ID, so we look
+            // up the UUID from AM_APPLICATION before building the path.
+            String applicationUUID = getApplicationUUID(subWorkFlowDTO.getApplicationId());
+            String appPath = applicationUUID != null
+                    ? applicationUUID
+                    : String.valueOf(subWorkFlowDTO.getApplicationId());
             String successUrl = checkoutSuccessUrl
-                    + "/" + subWorkFlowDTO.getApplicationId()
+                    + "/" + appPath
                     + "/subscriptions?session_id={CHECKOUT_SESSION_ID}";
 
             SessionCreateParams.Builder paramsBuilder = SessionCreateParams.builder()
@@ -925,6 +929,36 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
         }
         throw new WorkflowException(
                 "Connected account Stripe key not found for API: " + apiUuid);
+    }
+
+    /**
+     * Looks up the application UUID from the numeric {@code APPLICATION_ID} stored in
+     * {@code AM_APPLICATION}. The DevPortal uses UUIDs in its routes
+     * ({@code /devportal/applications/{UUID}/subscriptions}), not integer IDs.
+     *
+     * @param applicationId numeric application DB ID from {@link SubscriptionWorkflowDTO#getApplicationId()}
+     * @return the UUID string, or {@code null} if the lookup fails (the numeric ID is used as fallback)
+     */
+    private String getApplicationUUID(int applicationId) {
+        Connection conn = null;
+        java.sql.PreparedStatement ps = null;
+        java.sql.ResultSet rs = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            ps = conn.prepareStatement(
+                    "SELECT UUID FROM AM_APPLICATION WHERE APPLICATION_ID = ?");
+            ps.setInt(1, applicationId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return rs.getString("UUID");
+            }
+        } catch (java.sql.SQLException e) {
+            log.warn("Could not retrieve UUID for applicationId " + applicationId
+                    + " — numeric ID will be used in the Stripe success URL", e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+        }
+        return null;
     }
 
     /**
