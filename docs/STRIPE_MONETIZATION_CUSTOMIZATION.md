@@ -4,7 +4,7 @@
 
 This document describes:
 1. How the **default** WSO2 APIM Stripe monetization subscription workflow operates out-of-the-box.
-2. The **custom enhancements** implemented to support real payment method collection via Stripe Checkout, browser redirection, webhook-driven workflow resumption, and multi-application subscriber support.
+2. The **custom enhancements** implemented to support real payment method collection via Stripe Checkout, browser redirection, webhook-driven workflow resumption, parallel browser-redirect completion, and multi-application subscriber support.
 
 ---
 
@@ -151,12 +151,13 @@ sequenceDiagram
 
 1. Collect **real payment methods** from new subscribers using Stripe's hosted Checkout page.
 2. **Redirect** the subscriber's browser to Stripe Checkout during the subscription flow.
-3. **Resume** the APIM subscription workflow automatically after the subscriber enters their card.
+3. **Resume** the APIM subscription workflow automatically after the subscriber enters their card via **two parallel paths** — Stripe webhook and browser redirect — with a first-one-wins idempotency guard.
 4. Support subscribers with **multiple applications** subscribing to APIs (reuse existing payment method).
+5. Show a **loading UI** to the user while the subscription is being activated after Stripe redirect.
 
 ### 2.2 Solution Architecture
 
-The full flow spans three phases. The sequence diagram below shows every participant and every message in order.
+The full flow spans three phases with **two parallel completion paths** in Phase 3.
 
 ```mermaid
 sequenceDiagram
@@ -170,6 +171,7 @@ sequenceDiagram
     participant PA  as Stripe<br/>Platform Account
     participant SC  as Stripe Checkout<br/>(Hosted Page)
     participant WH  as Webhook WAR<br/>/api/am/stripe/webhook
+    participant CS  as Webhook WAR<br/>/api/am/stripe/complete-session
     participant CA  as Stripe<br/>Connected Account
 
     %% ════════════════════════════════════════════════════════
@@ -179,10 +181,11 @@ sequenceDiagram
         DP    ->>  API : POST /subscriptions<br/>{apiId, applicationId, tier}
         API   ->>  PLG : monetizeSubscription(workflowDTO, api)
 
-        PLG   ->>  PA  : Session.create()<br/>mode=SETUP, currency, metadata<br/>{workflowRef, subscriberId, appId, tier, ...}
+        PLG   ->>  DB  : getApplicationUUID(applicationId)<br/>→ look up UUID from AM_APPLICATION
+        PLG   ->>  PA  : Session.create()<br/>mode=SETUP, currency, metadata<br/>successUrl = checkoutSuccessUrl/{appUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}
         PA    -->> PLG : Checkout Session<br/>{id, url}
 
-        PLG   ->>  DB  : Save checkout session<br/>(session_id, workflowRef, subscriberId)
+        PLG   ->>  DB  : Save checkout session (STATUS=PENDING)<br/>(session_id, workflowRef, subscriberId)
         PLG   ->>  DB  : Set workflow status = CREATED (pending)
 
         PLG   -->> API : HttpWorkflowResponse<br/>{redirectUrl = session.url}
@@ -199,45 +202,46 @@ sequenceDiagram
 
     %% ════════════════════════════════════════════════════════
     rect rgb(230, 255, 235)
-        Note over SC,CA: Phase 3 — Webhook Resumes the Workflow
-        SC    ->>  WH  : POST /api/am/stripe/webhook<br/>Stripe-Signature: t=...,v1=...<br/>{type: "checkout.session.completed", ...}
+        Note over SC,CA: Phase 3 — Parallel Completion (first-one-wins)
 
-        WH    ->>  WH  : Verify HMAC-SHA256 signature<br/>using webhook secret from api-manager.xml
+        par Stripe Webhook Path
+            SC    ->>  WH  : POST /api/am/stripe/webhook<br/>Stripe-Signature: t=...,v1=...
+            WH    ->>  WH  : Verify HMAC-SHA256 signature
+            WH    ->>  DB  : retrieveWorkflow(workflowRef from metadata)
+            WH    ->>  PLG : complete(workflowDTO)<br/>attributes["checkoutSessionId"]=session.id
+            PLG   ->>  DB  : claimCheckoutSession()<br/>UPDATE STATUS PENDING→IN_PROGRESS<br/>(atomic — rowsAffected==1 wins)
+        and Browser Redirect Path
+            SC    ->>  User: Redirect to .../applications/{appUUID}/subscriptions?session_id=cs_xxx
+            User  ->>  DP  : Page loads — Subscriptions.jsx mounts
+            DP    ->>  DP  : componentDidMount detects ?session_id=<br/>→ show loading banner
+            DP    ->>  CS  : POST /api/am/stripe/complete-session?session_id=cs_xxx
+            CS    ->>  DB  : SELECT WORKFLOW_REFERENCE WHERE SESSION_ID=?
+            CS    ->>  PLG : complete(workflowDTO)<br/>attributes["checkoutSessionId"]=session.id
+            PLG   ->>  DB  : claimCheckoutSession()<br/>UPDATE STATUS PENDING→IN_PROGRESS<br/>(atomic — rowsAffected==1 wins)
+        end
 
-        WH    ->>  DB  : retrieveWorkflowFromInternalReference<br/>(workflowRef from session metadata)
-        DB    -->> WH  : WorkflowDTO (status=CREATED)
-
-        WH    ->>  PLG : WorkflowExecutor.complete(workflowDTO)<br/>attributes["checkoutSessionId"] = session.id
-
-        Note over PLG,CA: completeStripeCheckoutSubscription()
+        Note over PLG,CA: Only the path that wins the DB claim runs Stripe work.<br/>The loser sees rowsAffected=0 and skips to WF DB update only.
 
         PLG   ->>  PA  : Session.retrieve(checkoutSessionId)
-        PA    -->> PLG : Session {setup_intent}
-
-        PLG   ->>  PA  : SetupIntent.retrieve(setup_intent_id)
-        PA    -->> PLG : SetupIntent {payment_method_id}
-
-        PLG   ->>  PA  : Customer.create()<br/>{payment_method, invoice_settings.default_payment_method}
+        PLG   ->>  PA  : SetupIntent.retrieve → paymentMethodId
+        PLG   ->>  PA  : Customer.create(pm, invoice_settings.default_pm)
         PA    -->> PLG : Platform Customer {id}
         PLG   ->>  DB  : Save platform customer
 
-        PLG   ->>  CA  : PaymentMethod.create()<br/>{clone from platform customer}
-        CA    -->> PLG : Cloned PaymentMethod {id}
-
-        PLG   ->>  CA  : Customer.create()<br/>{cloned_pm, invoice_settings.default_payment_method}
+        PLG   ->>  CA  : PaymentMethod.create(clone from platform)
+        PLG   ->>  CA  : Customer.create(cloned_pm, invoice_settings.default_pm)
         CA    -->> PLG : Shared Customer {id}
         PLG   ->>  DB  : Save shared customer
 
-        PLG   ->>  CA  : Subscription.create()<br/>{shared_customer_id, plan_id}
+        PLG   ->>  CA  : Subscription.create(shared_customer_id, plan_id)
         CA    -->> PLG : Subscription {id}
         PLG   ->>  DB  : Save subscription
+        PLG   ->>  DB  : Mark checkout session = COMPLETED
+        PLG   ->>  DB  : Update subscription = UNBLOCKED
 
-        PLG   ->>  DB  : Update checkout session → COMPLETED
-        PLG   ->>  DB  : Update subscription status → UNBLOCKED
-
-        WH    -->> SC  : HTTP 200 {"received": true}<br/>(Stripe stops retrying)
-
-        SC    ->>  User: Redirect to checkoutSuccessUrl
+        WH    -->> SC  : HTTP 200 {"received": true}
+        CS    -->> DP  : HTTP 200 {"status": "completed"}
+        DP    ->>  DP  : Hide loading banner<br/>Refresh subscriptions list<br/>Show "Payment confirmed!" alert
     end
 ```
 
@@ -249,11 +253,12 @@ Three new decision points were added to `monetizeSubscription()`:
 
 **Decision 1 — New Subscriber (no platform customer)**
 Instead of creating a platform customer with `tok_visa`, the executor now:
-1. Creates a **Stripe Checkout Session** in `SETUP` mode on the platform account.
-2. Stores the session ID and workflow reference in the `AM_STRIPE_CHECKOUT_SESSIONS` database table.
-3. Sets the workflow status to `CREATED` (pending — do not approve yet).
-4. Returns an `HttpWorkflowResponse` with the Checkout Session URL as the redirect URL.
-5. APIM serialises this into `redirectionParams` in the subscription API response.
+1. Looks up the **application UUID** from `AM_APPLICATION` using `getApplicationUUID(applicationId)` (DevPortal routes use UUID, not integer ID).
+2. Creates a **Stripe Checkout Session** in `SETUP` mode on the platform account, with the success URL set to `{checkoutSuccessUrl}/{appUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}`.
+3. Stores the session ID and workflow reference in `AM_STRIPE_CHECKOUT_SESSIONS` with `STATUS=PENDING`.
+4. Sets the workflow status to `CREATED` (pending — do not approve yet).
+5. Returns an `HttpWorkflowResponse` with the Checkout Session URL as the redirect URL.
+6. APIM serialises this into `redirectionParams` in the subscription API response.
 
 **Decision 2 — Platform Customer exists, new Application (no shared customer)**
 When the subscriber already has a platform customer (from a previous subscription) but subscribes with a new application:
@@ -264,6 +269,19 @@ When the subscriber already has a platform customer (from a previous subscriptio
 **Decision 3 — Both customers exist**
 Proceeds directly to creating the Stripe Subscription (unchanged from default).
 
+**Idempotency guard in `complete()`**
+
+Both the webhook path and the browser-redirect path call `WorkflowExecutor.complete()` concurrently. Before running Stripe API calls, `complete()` atomically claims the checkout session:
+
+```sql
+UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'IN_PROGRESS'
+WHERE SESSION_ID = ? AND STATUS = 'PENDING'
+```
+
+- `rowsAffected == 1` → this path wins; proceed with Stripe work.
+- `rowsAffected == 0` → another path already claimed it; skip Stripe work, proceed to APIM workflow DB update only.
+- If Stripe work throws, the claim is reset (`IN_PROGRESS → PENDING`) so the other path can retry.
+
 #### B. DevPortal UI Override (`override/src/app/components/`)
 
 Two components were updated in the DevPortal override directory (takes precedence over source at runtime):
@@ -271,88 +289,91 @@ Two components were updated in the DevPortal override directory (takes precedenc
 - `Applications/Details/Subscriptions.jsx` — the subscriptions panel inside the Application detail view.
 - `Apis/Details/Credentials/Credentials.jsx` — the credentials/subscription panel inside the API detail view.
 
-When the subscription API responds with `status: ON_HOLD`, the UI now:
-1. Reads the `redirectionParams` field from the response body.
-2. Parses it as JSON to extract `redirectUrl`.
-3. Immediately redirects the browser (`window.location.href = redirectUrl`) to the Stripe Checkout page.
-4. Falls back to showing a "pending approval" message if no redirect URL is present.
+**Stripe redirect on `ON_HOLD`** (both files):
+When the subscription API responds with `status: ON_HOLD`, the UI reads `redirectionParams`, parses it as JSON to extract `redirectUrl`, and immediately redirects the browser to the Stripe Checkout page.
 
-Previously, these override files called a custom `/api/am/stripe/checkout-url` endpoint, which failed because it looked up the checkout session using the subscription UUID, but the database stored a numeric workflow reference — causing a mismatch and returning 404.
+**Browser-redirect completion** (`Subscriptions.jsx` only):
+After Stripe, the user lands on `.../applications/{appUUID}/subscriptions?session_id=cs_xxx`. On `componentDidMount`:
+1. Detects `session_id` query parameter in `window.location.search`.
+2. Sets state `stripeSessionCompleting: true`.
+3. Shows a **loading UI**:
+   - **Full-page spinner** if subscriptions haven't loaded yet ("Activating your subscription…").
+   - **Inline info banner** with spinner if subscriptions are already visible ("Confirming your payment…").
+4. Calls `POST /api/am/stripe/complete-session?session_id=cs_xxx`.
+5. On success: clears `session_id` from URL (`window.history.replaceState`), refreshes the subscription list, shows **"Payment confirmed! Your subscription is now active."** alert.
+6. On error: shows an error alert with support contact message.
 
 #### C. Stripe Webhook WAR (`api#am#stripe.war`)
 
-A standalone Java web application (WAR) deployed at `/api/am/stripe/` on the Carbon server. It exposes:
+A standalone Java web application (WAR) deployed at `/api/am/stripe/` on the Carbon server. It exposes three endpoints:
 
-- `POST /api/am/stripe/webhook` — receives `checkout.session.completed` events from Stripe.
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/am/stripe/webhook` | `POST` | Receives `checkout.session.completed` events from Stripe (HMAC-SHA256 verified) |
+| `/api/am/stripe/checkout-url` | `GET` | Returns Stripe Checkout URL for a pending session by workflow reference |
+| `/api/am/stripe/complete-session` | `POST` | Browser-redirect completion — called by DevPortal UI with `?session_id=cs_xxx` |
 
-Key design decisions:
-- **No stripe-java dependency** — stripe-java 24.x requires Gson 2.10+ (`GsonBuilder.addReflectionAccessFilter`), but the Carbon OSGi classloader exposes an older Gson version that shadows the WAR's bundled copy, causing `NoSuchMethodError` at startup. Instead, Stripe signature verification is implemented natively using Java's `javax.crypto.Mac` (HMAC-SHA256).
-- **Jackson for JSON parsing** — the event payload is parsed with Jackson's `ObjectMapper` (already bundled via `jackson-jaxrs-json-provider`), eliminating the Gson dependency entirely.
-- **Delegates workflow completion to the plugin** — the WAR only extracts the `workflowReference` from the session metadata and calls `WorkflowExecutorFactory.getWorkflowExecutor().complete()`. The actual Stripe customer/subscription creation runs inside `StripeSubscriptionCreationWorkflowExecutor.complete()` in the plugin OSGi bundle.
+**`/api/am/stripe/complete-session`** (`CompleteSessionApiServiceImpl`):
+1. Validates `session_id` format (must start with `cs_`).
+2. Queries `AM_STRIPE_CHECKOUT_SESSIONS` for the workflow reference and current status.
+3. If `STATUS=COMPLETED` → returns `{"status":"already_completed"}` (webhook already won).
+4. Otherwise loads the pending `WorkflowDTO`, sets `checkoutSessionId` attribute and `APPROVED` status, then calls `WorkflowExecutorFactory.complete()`.
+5. The executor's idempotency guard handles the race with the webhook.
 
-### 2.4 End-to-End Custom Flow
+Key design decisions for the WAR:
+- **No stripe-java dependency** — stripe-java 24.x requires Gson 2.10+ (`GsonBuilder.addReflectionAccessFilter`), but the Carbon OSGi classloader exposes an older Gson version that shadows the WAR's bundled copy, causing `NoSuchMethodError` at startup. Stripe signature verification is implemented natively using Java's `javax.crypto.Mac` (HMAC-SHA256).
+- **Jackson for JSON parsing** — the event payload is parsed with Jackson's `ObjectMapper`, eliminating the Gson dependency entirely.
+- **Delegates workflow completion to the plugin** — the WAR extracts context and calls `WorkflowExecutorFactory.getWorkflowExecutor().complete()`. The actual Stripe customer/subscription creation runs inside the plugin OSGi bundle.
+
+### 2.4 Full End-to-End Flow (Phase 3 detail)
 
 ```mermaid
 sequenceDiagram
     participant U as User (Browser)
-    participant DP as WSO2 DevPortal
-    participant API as APIM Store API
-    participant WF as StripeSubscriptionWorkflowExecutor
+    participant DP as WSO2 DevPortal<br/>Subscriptions.jsx
+    participant CS as complete-session<br/>endpoint
+    participant PLG as StripeSubscriptionWorkflowExecutor
     participant DB as APIM Database
+    participant WH as Webhook WAR
     participant PA as Stripe Platform Account
-    participant SC as Stripe Checkout (hosted)
-    participant WH as Webhook WAR<br/>/api/am/stripe/webhook
     participant CA as Stripe Connected Account
 
-    Note over U,CA: ─── Phase 1: Subscription Request ───
+    Note over U,CA: ─── After user enters card on Stripe ───
 
-    U->>DP: Subscribe to API (new subscriber)
-    DP->>API: POST /subscriptions
-    API->>WF: monetizeSubscription()
-    WF->>PA: Create Checkout Session (SETUP mode)<br/>metadata: {workflowReference, subscriberId,<br/>applicationId, tierName, apiUuid, ...}
-    PA-->>WF: session {id, url}
-    WF->>DB: Save checkout session<br/>(session_id, workflow_ref, subscriber_id, ...)
-    WF->>DB: Set workflow status = CREATED (pending)
-    WF-->>API: HttpWorkflowResponse<br/>redirectUrl = session.url
-    API-->>DP: {"status":"ON_HOLD",<br/>"redirectionParams":{"redirectUrl":"https://checkout.stripe.com/..."}}
-    DP->>U: window.location.href = redirectUrl
+    par Browser redirect path
+        Note over U,DP: Stripe → redirect to<br/>.../applications/{appUUID}/subscriptions?session_id=cs_xxx
+        U->>DP: Page loads
+        DP->>DP: componentDidMount:<br/>detect session_id → stripeSessionCompleting=true<br/>Show loading banner
+        DP->>CS: POST /complete-session?session_id=cs_xxx
+        CS->>DB: SELECT WORKFLOW_REFERENCE, STATUS<br/>WHERE SESSION_ID=cs_xxx
+        DB-->>CS: workflowRef=42, STATUS=PENDING
+        CS->>DB: retrieveWorkflowFromInternalReference(42)
+        DB-->>CS: WorkflowDTO
+        CS->>PLG: complete(workflowDTO)<br/>attributes[checkoutSessionId]=cs_xxx
+        PLG->>DB: UPDATE STATUS PENDING→IN_PROGRESS<br/>WHERE SESSION_ID=cs_xxx AND STATUS=PENDING
+        DB-->>PLG: rowsAffected=1 (WON) or 0 (LOST)
+    and Webhook path
+        Note over WH: Stripe fires webhook → POST /webhook
+        WH->>DB: retrieveWorkflow(workflowRef from metadata)
+        WH->>PLG: complete(workflowDTO)<br/>attributes[checkoutSessionId]=cs_xxx
+        PLG->>DB: UPDATE STATUS PENDING→IN_PROGRESS<br/>WHERE SESSION_ID=cs_xxx AND STATUS=PENDING
+        DB-->>PLG: rowsAffected=1 (WON) or 0 (LOST)
+    end
 
-    Note over U,CA: ─── Phase 2: User Enters Card on Stripe ───
+    Note over PLG,CA: Whichever path wins (rowsAffected=1) runs Stripe work:
 
-    U->>SC: Open Stripe Checkout page
-    U->>SC: Enter card details and confirm
-    SC-->>U: Redirect to checkoutSuccessUrl?session_id=xxx
+    PLG->>PA: Session.retrieve → SetupIntent → paymentMethodId
+    PLG->>PA: Customer.create(pm, invoice_settings.default_pm)
+    PLG->>DB: Save platform customer
+    PLG->>CA: PaymentMethod.create(clone) → Customer.create(cloned_pm)
+    PLG->>DB: Save shared customer
+    PLG->>CA: Subscription.create(shared_customer_id, plan_id)
+    PLG->>DB: Save subscription
+    PLG->>DB: Mark session COMPLETED
+    PLG->>DB: Update subscription → UNBLOCKED
 
-    Note over U,CA: ─── Phase 3: Webhook Resumes Workflow ───
-
-    SC->>WH: POST /api/am/stripe/webhook<br/>Stripe-Signature: t=...,v1=...
-    WH->>WH: Verify HMAC-SHA256 signature<br/>(native javax.crypto.Mac)
-    WH->>WH: Parse event JSON (Jackson)<br/>event.type = "checkout.session.completed"
-    WH->>DB: retrieveWorkflowFromInternalReference(workflowReference)
-    DB-->>WH: WorkflowDTO (CREATED status)
-    WH->>WH: Set workflowDTO.attributes["checkoutSessionId"] = session.id
-    WH->>WH: Set workflowDTO.status = APPROVED
-    WH->>WF: WorkflowExecutor.complete(workflowDTO)
-
-    Note over WF,CA: ─── completeStripeCheckoutSubscription() ───
-
-    WF->>PA: Session.retrieve(checkoutSessionId)
-    PA-->>WF: session (with setup_intent)
-    WF->>PA: SetupIntent.retrieve(setup_intent_id)
-    PA-->>WF: paymentMethodId
-    WF->>PA: Customer.create(paymentMethodId,<br/>invoice_settings.default_payment_method)
-    PA-->>WF: platform_customer_id
-    WF->>DB: Save platform customer
-    WF->>CA: PaymentMethod.create(clone from platform)<br/>→ cloned_payment_method_id
-    WF->>CA: Customer.create(cloned_pm,<br/>invoice_settings.default_payment_method)
-    CA-->>WF: shared_customer_id
-    WF->>DB: Save shared customer
-    WF->>CA: Subscription.create(shared_customer_id, plan_id)
-    CA-->>WF: subscription_id
-    WF->>DB: Save subscription
-    WF->>DB: Mark checkout session = COMPLETED
-    WF->>DB: Update subscription status = UNBLOCKED
-    WH-->>SC: HTTP 200 {"received":true}
+    CS-->>DP: {"status":"completed"}
+    DP->>DP: stripeSessionCompleting=false<br/>Clear ?session_id from URL<br/>Refresh subscription list<br/>Alert: "Payment confirmed!"
 ```
 
 ### 2.5 Second Application Subscription Flow (Returning Subscriber)
@@ -421,17 +442,34 @@ flowchart TD
 | `AM_STRIPE_PLATFORM_CUSTOMER` | Maps APIM subscriber ID to Stripe platform customer ID |
 | `AM_STRIPE_SHARED_CUSTOMER` | Maps application + API provider to Stripe connected-account customer ID |
 | `AM_STRIPE_SUBSCRIPTION` | Maps APIM subscription to Stripe subscription ID |
-| `AM_STRIPE_CHECKOUT_SESSIONS` | (New) Stores active checkout sessions: session ID, workflow reference, subscriber, status |
+| `AM_STRIPE_CHECKOUT_SESSIONS` | Stores active checkout sessions: session ID, workflow reference, subscriber, status |
+
+#### `AM_STRIPE_CHECKOUT_SESSIONS` — Status Values
+
+| Status | Meaning |
+|---|---|
+| `PENDING` | Session created, waiting for subscriber to complete card entry on Stripe |
+| `IN_PROGRESS` | Atomically claimed by one completion path (webhook or browser-redirect) — Stripe work is running |
+| `COMPLETED` | Subscription successfully activated |
+| `EXPIRED` | Session expired before the subscriber entered a card |
 
 ### 2.8 Configuration
 
-**`workflow-extensions.xml`** — two new properties on the executor:
+**`workflow-extensions.xml`** — set `checkoutSuccessUrl` to the **base applications URL** (the plugin appends `/{applicationUUID}/subscriptions` automatically):
+
 ```xml
-<Executor name="org.wso2.apim.monetization.impl.workflow.StripeSubscriptionCreationWorkflowExecutor">
-    <Property name="checkoutSuccessUrl">https://&lt;devportal-host&gt;:9443/devportal/subscription/success</Property>
-    <Property name="checkoutCancelUrl">https://&lt;devportal-host&gt;:9443/devportal/subscription/cancel</Property>
-</Executor>
+<SubscriptionCreation executor="org.wso2.apim.monetization.impl.workflow.StripeSubscriptionCreationWorkflowExecutor">
+    <Property name="checkoutSuccessUrl">https://&lt;devportal-host&gt;:9443/devportal/applications</Property>
+    <Property name="checkoutCancelUrl">https://&lt;devportal-host&gt;:9443/devportal/applications</Property>
+</SubscriptionCreation>
 ```
+
+At runtime, Stripe is configured with a success URL of:
+```
+https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}
+```
+
+> **Important:** Do NOT add `/subscriptions` to `checkoutSuccessUrl` — the plugin appends it dynamically using the application UUID looked up from `AM_APPLICATION`. Using the integer application ID (e.g. `/applications/57/subscriptions`) causes a "Page Not Found" error because DevPortal routes use UUIDs.
 
 **`api-manager.xml`** — webhook signing secret:
 ```xml
@@ -456,6 +494,8 @@ flowchart TD
 | 4 | Webhook `NoSuchMethodError: GsonBuilder.addReflectionAccessFilter` | `stripe-java 24.x` calls Gson 2.10+ API, but the Carbon OSGi classloader exposes an older Gson that shadows the WAR's bundled copy | Removed stripe-java from the webhook WAR entirely; implemented HMAC-SHA256 verification natively with `javax.crypto.Mac` and parsed event JSON with Jackson |
 | 5 | `No attached payment method` on Subscription.create | `createSharedCustomerWithPaymentMethod` attached the payment method to the customer but did not set `invoice_settings.default_payment_method` — Stripe requires this for subscription billing | Added `invoice_settings.default_payment_method = clonedPm.getId()` to the shared customer creation params |
 | 6 | Second-application subscription fails — `Token.create: customer must have an active payment source` | The legacy `createSharedCustomer` uses `Token.create` which requires a Stripe **source** (legacy card) on the platform customer. Checkout-created customers have a `payment_method` instead — incompatible with the Token API | Added `getDefaultPaymentMethodId()` helper: if the platform customer has a default payment method (Checkout path), use `createSharedCustomerWithPaymentMethod`; otherwise fall back to the legacy `createSharedCustomer` |
+| 7 | No loading UI or success alert after Stripe redirect | `checkoutSuccessUrl` pointed to `/devportal/applications` (the Applications list page) — `Subscriptions.jsx` never mounted so `session_id` was never detected | Added browser-redirect completion path to `Subscriptions.jsx` (`componentDidMount` detects `?session_id=`) and `POST /api/am/stripe/complete-session` endpoint |
+| 8 | "Page Not Found" after Stripe redirect | Success URL used `subWorkFlowDTO.getApplicationId()` (integer `57`) but DevPortal routes use the application UUID — route `/applications/57/subscriptions` does not exist | Added `getApplicationUUID(int applicationId)` which queries `AM_APPLICATION.UUID`; success URL now uses the UUID |
 
 ---
 
@@ -463,22 +503,27 @@ flowchart TD
 
 ```
 [ ] Build the plugin JAR:
-      cd wso2-am-stripe-plugin && mvn clean package
+      cd stripe-plugin && mvn clean package
       Copy target/org.wso2.apim.monetization.impl-*.jar
           → <APIM_HOME>/repository/components/dropins/
+          → <APIM_HOME>/repository/components/lib/
 
 [ ] Build the webhook WAR:
-      cd wso2-am-stripe-webhook && mvn clean package
+      cd stripe-webhook && mvn clean package
       Copy target/api#am#stripe.war
           → <APIM_HOME>/repository/deployment/server/webapps/
 
-[ ] DevPortal UI overrides are already in place at:
+[ ] DevPortal UI overrides — place in override/src/ (no rebuild required at runtime):
       <APIM_HOME>/repository/deployment/server/webapps/devportal/
         override/src/app/components/Applications/Details/Subscriptions.jsx
         override/src/app/components/Apis/Details/Credentials/Credentials.jsx
+      If running build:dev / npm start — ensure override/ files are present;
+      the webpack resolver picks override/ over source/ automatically.
 
 [ ] Configure workflow-extensions.xml:
-      Add checkoutSuccessUrl and checkoutCancelUrl properties
+      checkoutSuccessUrl = https://<devportal-host>:9443/devportal/applications
+      checkoutCancelUrl  = https://<devportal-host>:9443/devportal/applications
+      NOTE: Do NOT append /subscriptions — the plugin adds /{appUUID}/subscriptions
 
 [ ] Configure api-manager.xml:
       Add <StripeWebhookSecret>whsec_...</StripeWebhookSecret> under <Monetization>
