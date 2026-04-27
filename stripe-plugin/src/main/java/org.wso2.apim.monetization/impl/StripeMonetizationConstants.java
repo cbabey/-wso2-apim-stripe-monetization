@@ -156,6 +156,9 @@ public class StripeMonetizationConstants {
     public static final String CHECKOUT_METADATA_API_NAME = "apiName";
     public static final String CHECKOUT_METADATA_API_VERSION = "apiVersion";
 
+    // Stripe Subscription status values returned by the Stripe API
+    public static final String SUBSCRIPTION_STATUS_INCOMPLETE = "incomplete";
+
     // Stripe Checkout Session — DB status values
     public static final String CHECKOUT_SESSION_STATUS_PENDING = "PENDING";
     public static final String CHECKOUT_SESSION_STATUS_IN_PROGRESS = "IN_PROGRESS";

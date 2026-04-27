@@ -643,6 +643,22 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                 log.error(errorMsg);
                 throw new WorkflowException(errorMsg, ex);
             }
+            // Fix 1: Stripe does not throw an exception when the initial invoice payment
+            // fails — it silently creates the subscription with status "incomplete".
+            // Detect this and abort so the APIM subscription is never set to UNBLOCKED.
+            if (StripeMonetizationConstants.SUBSCRIPTION_STATUS_INCOMPLETE.equals(subscription.getStatus())) {
+                try {
+                    subscription.cancel((Map<String, Object>) null, requestOptions);
+                } catch (StripeException cancelEx) {
+                    log.error("Failed to cancel incomplete Stripe subscription " + subscription.getId()
+                            + " for Application : " + subWorkFlowDTO.getApplicationName(), cancelEx);
+                }
+                String errorMsg = "Initial payment failed for Application : " + subWorkFlowDTO.getApplicationName()
+                        + ". Stripe subscription " + subscription.getId()
+                        + " was incomplete and has been cancelled.";
+                log.error(errorMsg);
+                throw new WorkflowException(errorMsg);
+            }
             try {
                 stripeMonetizationDAO.addBESubscription(identifier, subWorkFlowDTO.getApplicationId(),
                         subWorkFlowDTO.getTenantId(), sharedCustomer.getId(), subscription.getId(), apiUuid);
@@ -764,8 +780,26 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                     throw e;
                 }
             } else {
+                // Session is either IN_PROGRESS (another path is currently processing it)
+                // or COMPLETED (another path already finished successfully).
+                // Only allow fall-through to updateSubscriptionStatus when COMPLETED.
+                // If IN_PROGRESS the outcome is unknown — do NOT set UNBLOCKED prematurely.
+                Map<String, String> sessionRow;
+                try {
+                    sessionRow = stripeMonetizationDAO.getCheckoutSession(checkoutSessionId);
+                } catch (StripeMonetizationException e) {
+                    throw new WorkflowException("Failed to read session status for: " + checkoutSessionId, e);
+                }
+                String currentStatus = sessionRow.get(StripeMonetizationConstants.CHECKOUT_COL_STATUS);
+                if (!StripeMonetizationConstants.CHECKOUT_SESSION_STATUS_COMPLETED.equals(currentStatus)) {
+                    // Another path claimed the session but has not finished yet (or failed).
+                    // Throw so the subscription status is not updated to UNBLOCKED.
+                    throw new WorkflowException("Checkout session " + checkoutSessionId
+                            + " is still being processed by another path (status=" + currentStatus
+                            + ") — aborting to avoid premature subscription activation");
+                }
                 log.info("Stripe checkout session " + checkoutSessionId
-                        + " already claimed or completed — skipping Stripe work in this path");
+                        + " already completed by another path — skipping Stripe work");
             }
         }
 
