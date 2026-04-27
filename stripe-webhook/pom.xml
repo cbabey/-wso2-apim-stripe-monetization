@@ -34,7 +34,7 @@
     </description>
 
     <properties>
-        <carbon.apimgt.version>9.20.88</carbon.apimgt.version>
+        <carbon.apimgt.version>9.32.130</carbon.apimgt.version>
         <maven.compiler.version>3.8.1</maven.compiler.version>
         <maven.war.version>3.2.3</maven.war.version>
     </properties>

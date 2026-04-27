@@ -24,10 +24,15 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.cxf.jaxrs.ext.MessageContext;
 import org.wso2.apim.monetization.webhook.WebhookApiService;
 import org.wso2.carbon.apimgt.api.APIManagementException;
+import org.wso2.carbon.apimgt.api.model.SubscribedAPI;
+import org.wso2.carbon.apimgt.impl.APIConstants;
 import org.wso2.carbon.apimgt.impl.APIManagerConfiguration;
 import org.wso2.carbon.apimgt.impl.dao.ApiMgtDAO;
 import org.wso2.carbon.apimgt.impl.dto.WorkflowDTO;
 import org.wso2.carbon.apimgt.impl.internal.ServiceReferenceHolder;
+import org.wso2.carbon.apimgt.impl.notifier.events.SubscriptionEvent;
+import org.wso2.carbon.apimgt.impl.utils.APIMgtDBUtil;
+import org.wso2.carbon.apimgt.impl.utils.APIUtil;
 import org.wso2.carbon.apimgt.impl.workflow.WorkflowConstants;
 import org.wso2.carbon.apimgt.impl.workflow.WorkflowException;
 import org.wso2.carbon.apimgt.impl.workflow.WorkflowExecutor;
@@ -40,6 +45,10 @@ import javax.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 
 /**
  * Handles inbound Stripe webhook events.
@@ -85,6 +94,32 @@ public class WebhookApiServiceImpl implements WebhookApiService {
      * Stripe event type fired when a Checkout Session is completed by the customer.
      */
     private static final String EVENT_CHECKOUT_SESSION_COMPLETED = "checkout.session.completed";
+
+    /**
+     * Stripe event type fired when an invoice payment attempt fails.
+     * Used to block the APIM subscription when a renewal charge cannot be collected.
+     */
+    private static final String EVENT_INVOICE_PAYMENT_FAILED = "invoice.payment_failed";
+
+    /**
+     * Stripe event type fired whenever a subscription's status changes
+     * (e.g. past_due → active after a retry succeeds, or active → canceled).
+     * Used to keep the APIM subscription status in sync with Stripe.
+     */
+    private static final String EVENT_SUBSCRIPTION_UPDATED = "customer.subscription.updated";
+
+    /**
+     * SQL to resolve a Stripe subscription ID to the APIM subscription UUID and tenant ID.
+     * AM_MONETIZATION_SUBSCRIPTIONS stores the Stripe subscription ID alongside the
+     * numeric API and application IDs, which are joined back to AM_SUBSCRIPTION for the UUID.
+     */
+    private static final String GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID =
+            "SELECT s.UUID, ms.TENANT_ID " +
+            "FROM AM_SUBSCRIPTION s " +
+            "JOIN AM_MONETIZATION_SUBSCRIPTIONS ms " +
+            "  ON ms.SUBSCRIBED_API_ID = s.API_ID " +
+            "  AND ms.SUBSCRIBED_APPLICATION_ID = s.APPLICATION_ID " +
+            "WHERE ms.SUBSCRIPTION_ID = ?";
 
     /**
      * Key used in Stripe session metadata to carry the APIM workflow internal reference
@@ -151,6 +186,10 @@ public class WebhookApiServiceImpl implements WebhookApiService {
         // 5. Route by event type
         if (EVENT_CHECKOUT_SESSION_COMPLETED.equals(eventType)) {
             handleCheckoutSessionCompleted(event);
+        } else if (EVENT_INVOICE_PAYMENT_FAILED.equals(eventType)) {
+            handleInvoicePaymentFailed(event);
+        } else if (EVENT_SUBSCRIPTION_UPDATED.equals(eventType)) {
+            handleSubscriptionUpdated(event);
         } else {
             if (log.isDebugEnabled()) {
                 log.debug("Stripe webhook: ignoring unhandled event type: " + eventType);
@@ -298,6 +337,203 @@ public class WebhookApiServiceImpl implements WebhookApiService {
             log.error("Stripe webhook: workflow execution error for workflowReference="
                     + workflowReference, e);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 2 — invoice.payment_failed
+    // -------------------------------------------------------------------------
+
+    /**
+     * Handles {@code invoice.payment_failed} events.
+     *
+     * <p>Fired when a subscription renewal invoice cannot be collected (e.g. card
+     * declined or insufficient funds). Blocks the APIM subscription and notifies
+     * all Gateway instances via a {@code SUBSCRIPTIONS_UPDATE} event so API calls
+     * are rejected immediately.
+     */
+    private void handleInvoicePaymentFailed(JsonNode event) {
+
+        // Invoice object is at event.data.object; the subscription field holds the Stripe sub ID
+        String stripeSubscriptionId = event.path("data").path("object")
+                .path("subscription").asText(null);
+
+        if (StringUtils.isBlank(stripeSubscriptionId)) {
+            log.warn("Stripe webhook invoice.payment_failed: no subscription ID in event payload");
+            return;
+        }
+
+        try {
+            updateAPIMSubscriptionStatus(stripeSubscriptionId, APIConstants.SubscriptionStatus.BLOCKED);
+            log.info("Stripe webhook invoice.payment_failed: blocked APIM subscription "
+                    + "for Stripe subscription=" + stripeSubscriptionId);
+        } catch (APIManagementException e) {
+            log.error("Stripe webhook invoice.payment_failed: failed to block APIM subscription "
+                    + "for Stripe subscription=" + stripeSubscriptionId, e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 3 — customer.subscription.updated
+    // -------------------------------------------------------------------------
+
+    /**
+     * Handles {@code customer.subscription.updated} events.
+     *
+     * <p>Fired whenever a Stripe subscription transitions to a new status. Maps the
+     * Stripe status to an APIM status and updates the subscription + notifies the Gateway:
+     * <ul>
+     *   <li>{@code active}              → {@code UNBLOCKED} (payment recovered)</li>
+     *   <li>{@code past_due}            → {@code BLOCKED}   (renewal failed, retrying)</li>
+     *   <li>{@code canceled}            → {@code BLOCKED}   (all retries exhausted)</li>
+     *   <li>{@code incomplete_expired}  → {@code BLOCKED}   (initial period expired)</li>
+     *   <li>All other statuses          → ignored</li>
+     * </ul>
+     */
+    private void handleSubscriptionUpdated(JsonNode event) {
+
+        JsonNode subNode = event.path("data").path("object");
+        String stripeSubscriptionId = subNode.path("id").asText(null);
+        String stripeStatus = subNode.path("status").asText(null);
+
+        if (StringUtils.isBlank(stripeSubscriptionId) || StringUtils.isBlank(stripeStatus)) {
+            log.warn("Stripe webhook customer.subscription.updated: missing id or status in event");
+            return;
+        }
+
+        String newApimStatus = mapStripeStatusToAPIM(stripeStatus);
+        if (newApimStatus == null) {
+            if (log.isDebugEnabled()) {
+                log.debug("Stripe webhook customer.subscription.updated: ignoring unmapped status="
+                        + stripeStatus + " for subscription=" + stripeSubscriptionId);
+            }
+            return;
+        }
+
+        try {
+            updateAPIMSubscriptionStatus(stripeSubscriptionId, newApimStatus);
+            log.info("Stripe webhook customer.subscription.updated: set APIM subscription to "
+                    + newApimStatus + " for Stripe subscription=" + stripeSubscriptionId
+                    + " (Stripe status=" + stripeStatus + ")");
+        } catch (APIManagementException e) {
+            log.error("Stripe webhook customer.subscription.updated: failed to update APIM subscription "
+                    + "for Stripe subscription=" + stripeSubscriptionId, e);
+        }
+    }
+
+    /**
+     * Maps a Stripe subscription status string to the corresponding APIM subscription status.
+     *
+     * @return the APIM status string, or {@code null} if the Stripe status should be ignored
+     */
+    private String mapStripeStatusToAPIM(String stripeStatus) {
+        switch (stripeStatus) {
+            case "active":
+                return APIConstants.SubscriptionStatus.UNBLOCKED;
+            case "past_due":
+            case "canceled":
+            case "incomplete_expired":
+                return APIConstants.SubscriptionStatus.BLOCKED;
+            default:
+                return null; // trialing, paused, unpaid — not mapped
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared helper — DB update + gateway event
+    // -------------------------------------------------------------------------
+
+    /**
+     * Updates an APIM subscription status and notifies all Gateway instances.
+     *
+     * <p>Two operations are performed atomically from the caller's perspective:
+     * <ol>
+     *   <li>DB update via {@code ApiMgtDAO.updateSubscription(SubscribedAPI)} — persists
+     *       the new status in {@code AM_SUBSCRIPTION}.</li>
+     *   <li>Gateway notification via {@code APIUtil.sendNotification()} with a
+     *       {@code SUBSCRIPTIONS_UPDATE} event — ensures every Gateway node enforces
+     *       the new status in real time without a server restart.</li>
+     * </ol>
+     *
+     * <p>This mirrors the logic inside {@code APIProviderImpl.updateSubscription()} but
+     * without requiring an {@code APIProvider} instance (which needs tenant Carbon context).
+     *
+     * @param stripeSubscriptionId Stripe subscription ID (e.g. {@code sub_xxx})
+     * @param newStatus            target APIM status ({@code BLOCKED} or {@code UNBLOCKED})
+     */
+    private void updateAPIMSubscriptionStatus(String stripeSubscriptionId, String newStatus)
+            throws APIManagementException {
+
+        // 1. Resolve Stripe subscription ID → APIM subscription UUID + tenantId
+        String[] subInfo = lookupAPIMSubscription(stripeSubscriptionId);
+        if (subInfo == null) {
+            log.warn("updateAPIMSubscriptionStatus: no APIM subscription found for "
+                    + "Stripe subscription=" + stripeSubscriptionId + " — may have been deleted");
+            return;
+        }
+        String subscriptionUUID = subInfo[0];
+        int tenantId = Integer.parseInt(subInfo[1]);
+
+        // 2. Load full SubscribedAPI (needed for DB update and gateway event)
+        ApiMgtDAO apiMgtDAO = ApiMgtDAO.getInstance();
+        SubscribedAPI subscribedAPI = apiMgtDAO.getSubscriptionByUUID(subscriptionUUID);
+        if (subscribedAPI == null) {
+            log.warn("updateAPIMSubscriptionStatus: SubscribedAPI not found for UUID="
+                    + subscriptionUUID);
+            return;
+        }
+
+        // 3. Idempotency — skip if already at target status
+        if (newStatus.equals(subscribedAPI.getSubStatus())) {
+            if (log.isDebugEnabled()) {
+                log.debug("updateAPIMSubscriptionStatus: subscription " + subscriptionUUID
+                        + " already has status=" + newStatus + " — skipping");
+            }
+            return;
+        }
+
+        // 4. Persist new status in AM_SUBSCRIPTION
+        subscribedAPI.setSubStatus(newStatus);
+        apiMgtDAO.updateSubscription(subscribedAPI);
+
+        // 5. Fire SUBSCRIPTIONS_UPDATE event so all Gateway nodes enforce immediately
+        String tenantDomain = APIUtil.getTenantDomainFromTenantId(tenantId);
+        SubscriptionEvent subscriptionEvent = new SubscriptionEvent(
+                APIConstants.EventType.SUBSCRIPTIONS_UPDATE.name(),
+                subscribedAPI,
+                tenantId,
+                tenantDomain);
+        APIUtil.sendNotification(subscriptionEvent, APIConstants.NotifierType.SUBSCRIPTIONS.name());
+    }
+
+    /**
+     * Resolves a Stripe subscription ID to the APIM subscription UUID and tenant ID
+     * by querying {@code AM_MONETIZATION_SUBSCRIPTIONS} joined to {@code AM_SUBSCRIPTION}.
+     *
+     * @return {@code String[]{uuid, tenantId}} or {@code null} if not found
+     */
+    private String[] lookupAPIMSubscription(String stripeSubscriptionId) {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            ps = conn.prepareStatement(GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID);
+            ps.setString(1, stripeSubscriptionId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return new String[]{
+                        rs.getString("UUID"),
+                        String.valueOf(rs.getInt("TENANT_ID"))
+                };
+            }
+        } catch (SQLException e) {
+            log.error("DB error looking up APIM subscription for Stripe subscription="
+                    + stripeSubscriptionId, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+        }
+        return null;
     }
 
     /**
