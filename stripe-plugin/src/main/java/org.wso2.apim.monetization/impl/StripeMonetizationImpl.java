@@ -1282,7 +1282,7 @@ public class StripeMonetizationImpl implements Monetization {
         String apiName = null;
         try (Connection con = APIMgtDBUtil.getConnection()) {
             SubscribedAPI subscribedAPI = ApiMgtDAO.getInstance().getSubscriptionByUUID(subscriptionUUID);
-            APIIdentifier apiIdentifier = subscribedAPI.getApiId();
+            APIIdentifier apiIdentifier = subscribedAPI.getAPIIdentifier();
             APIProductIdentifier apiProductIdentifier;
             API api;
             APIProduct apiProduct;
@@ -1631,7 +1631,7 @@ public class StripeMonetizationImpl implements Monetization {
         UserContext userCtx = new UserContext(username, org, properties, roles);
         try {
             PublisherAPISearchResult searchAPIs = apiPersistenceInstance.searchAPIsForPublisher(org, "", 0,
-                    Integer.MAX_VALUE, userCtx, null, null);
+                    Integer.MAX_VALUE, userCtx);
 
             if (searchAPIs != null) {
                 List<PublisherAPIInfo> list = searchAPIs.getPublisherAPIInfoList();

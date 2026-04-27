@@ -68,7 +68,7 @@
     </repositories>
 
     <properties>
-        <carbon.apimgt.version>9.20.88</carbon.apimgt.version>
+        <carbon.apimgt.version>9.32.130</carbon.apimgt.version>
         <commons.lang.version>2.6</commons.lang.version>
         <stripe.version>24.3.0</stripe.version>
         <elastic.client.version>8.3.1</elastic.client.version>
