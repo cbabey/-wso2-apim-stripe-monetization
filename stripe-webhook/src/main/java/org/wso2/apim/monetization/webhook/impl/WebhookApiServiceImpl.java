@@ -22,6 +22,9 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.cxf.jaxrs.ext.MessageContext;
+import org.wso2.apim.monetization.impl.StripeMonetizationConstants;
+import org.wso2.apim.monetization.impl.StripeMonetizationDAO;
+import org.wso2.apim.monetization.impl.StripeMonetizationException;
 import org.wso2.apim.monetization.webhook.WebhookApiService;
 import org.wso2.carbon.apimgt.api.APIManagementException;
 import org.wso2.carbon.apimgt.api.model.SubscribedAPI;
@@ -31,7 +34,6 @@ import org.wso2.carbon.apimgt.impl.dao.ApiMgtDAO;
 import org.wso2.carbon.apimgt.impl.dto.WorkflowDTO;
 import org.wso2.carbon.apimgt.impl.internal.ServiceReferenceHolder;
 import org.wso2.carbon.apimgt.impl.notifier.events.SubscriptionEvent;
-import org.wso2.carbon.apimgt.impl.utils.APIMgtDBUtil;
 import org.wso2.carbon.apimgt.impl.utils.APIUtil;
 import org.wso2.carbon.apimgt.impl.workflow.WorkflowConstants;
 import org.wso2.carbon.apimgt.impl.workflow.WorkflowException;
@@ -45,10 +47,6 @@ import javax.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 
 /**
  * Handles inbound Stripe webhook events.
@@ -108,18 +106,7 @@ public class WebhookApiServiceImpl implements WebhookApiService {
      */
     private static final String EVENT_SUBSCRIPTION_UPDATED = "customer.subscription.updated";
 
-    /**
-     * SQL to resolve a Stripe subscription ID to the APIM subscription UUID and tenant ID.
-     * AM_MONETIZATION_SUBSCRIPTIONS stores the Stripe subscription ID alongside the
-     * numeric API and application IDs, which are joined back to AM_SUBSCRIPTION for the UUID.
-     */
-    private static final String GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID =
-            "SELECT s.UUID, ms.TENANT_ID " +
-            "FROM AM_SUBSCRIPTION s " +
-            "JOIN AM_MONETIZATION_SUBSCRIPTIONS ms " +
-            "  ON ms.SUBSCRIBED_API_ID = s.API_ID " +
-            "  AND ms.SUBSCRIBED_APPLICATION_ID = s.APPLICATION_ID " +
-            "WHERE ms.SUBSCRIPTION_ID = ?";
+    // SQL is centralised in StripeMonetizationConstants (stripe-plugin)
 
     /**
      * Key used in Stripe session metadata to carry the APIM workflow internal reference
@@ -426,16 +413,14 @@ public class WebhookApiServiceImpl implements WebhookApiService {
      * @return the APIM status string, or {@code null} if the Stripe status should be ignored
      */
     private String mapStripeStatusToAPIM(String stripeStatus) {
-        switch (stripeStatus) {
-            case "active":
-                return APIConstants.SubscriptionStatus.UNBLOCKED;
-            case "past_due":
-            case "canceled":
-            case "incomplete_expired":
-                return APIConstants.SubscriptionStatus.BLOCKED;
-            default:
-                return null; // trialing, paused, unpaid — not mapped
+        if (StripeMonetizationConstants.SUBSCRIPTION_STATUS_ACTIVE.equals(stripeStatus)) {
+            return APIConstants.SubscriptionStatus.UNBLOCKED;
+        } else if (StripeMonetizationConstants.SUBSCRIPTION_STATUS_PAST_DUE.equals(stripeStatus)
+                || StripeMonetizationConstants.SUBSCRIPTION_STATUS_CANCELED.equals(stripeStatus)
+                || StripeMonetizationConstants.SUBSCRIPTION_STATUS_INCOMPLETE_EXPIRED.equals(stripeStatus)) {
+            return APIConstants.SubscriptionStatus.BLOCKED;
         }
+        return null; // trialing, paused, unpaid — not mapped
     }
 
     // -------------------------------------------------------------------------
@@ -507,33 +492,19 @@ public class WebhookApiServiceImpl implements WebhookApiService {
 
     /**
      * Resolves a Stripe subscription ID to the APIM subscription UUID and tenant ID
-     * by querying {@code AM_MONETIZATION_SUBSCRIPTIONS} joined to {@code AM_SUBSCRIPTION}.
+     * via {@link StripeMonetizationDAO#getAPIMSubscriptionInfoByStripeSubId(String)}.
      *
      * @return {@code String[]{uuid, tenantId}} or {@code null} if not found
      */
     private String[] lookupAPIMSubscription(String stripeSubscriptionId) {
-
-        Connection conn = null;
-        PreparedStatement ps = null;
-        ResultSet rs = null;
         try {
-            conn = APIMgtDBUtil.getConnection();
-            ps = conn.prepareStatement(GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID);
-            ps.setString(1, stripeSubscriptionId);
-            rs = ps.executeQuery();
-            if (rs.next()) {
-                return new String[]{
-                        rs.getString("UUID"),
-                        String.valueOf(rs.getInt("TENANT_ID"))
-                };
-            }
-        } catch (SQLException e) {
+            return StripeMonetizationDAO.getInstance()
+                    .getAPIMSubscriptionInfoByStripeSubId(stripeSubscriptionId);
+        } catch (StripeMonetizationException e) {
             log.error("DB error looking up APIM subscription for Stripe subscription="
                     + stripeSubscriptionId, e);
-        } finally {
-            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+            return null;
         }
-        return null;
     }
 
     /**

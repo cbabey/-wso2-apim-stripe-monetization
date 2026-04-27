@@ -383,6 +383,46 @@ public class StripeMonetizationDAO {
      * @return subscription UUID
      * @throws StripeMonetizationException if failed to get subscription UUID given the subscription ID
      */
+    /**
+     * Resolves a Stripe subscription ID to the APIM subscription UUID and tenant ID.
+     *
+     * <p>Used by Fix 2 ({@code invoice.payment_failed}) and Fix 3
+     * ({@code customer.subscription.updated}) to locate the APIM subscription
+     * that must be blocked or unblocked when Stripe reports a payment status change.
+     *
+     * @param stripeSubscriptionId Stripe subscription ID (e.g. {@code sub_xxx})
+     * @return {@code String[]{uuid, tenantId}} or {@code null} if no matching subscription found
+     * @throws StripeMonetizationException if a DB error occurs
+     */
+    public String[] getAPIMSubscriptionInfoByStripeSubId(String stripeSubscriptionId)
+            throws StripeMonetizationException {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            ps = conn.prepareStatement(
+                    StripeMonetizationConstants.GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID);
+            ps.setString(1, stripeSubscriptionId);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return new String[]{
+                        rs.getString("UUID"),
+                        String.valueOf(rs.getInt("TENANT_ID"))
+                };
+            }
+            return null;
+        } catch (SQLException e) {
+            String errorMessage = "Error while looking up APIM subscription "
+                    + "for Stripe subscription ID : " + stripeSubscriptionId;
+            log.error(errorMessage, e);
+            throw new StripeMonetizationException(errorMessage, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+        }
+    }
+
     public String getSubscriptionUUID(int subscriptionId) throws StripeMonetizationException {
 
         Connection conn = null;

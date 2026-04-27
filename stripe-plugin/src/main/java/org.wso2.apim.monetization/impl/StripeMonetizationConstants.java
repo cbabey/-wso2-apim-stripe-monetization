@@ -157,7 +157,24 @@ public class StripeMonetizationConstants {
     public static final String CHECKOUT_METADATA_API_VERSION = "apiVersion";
 
     // Stripe Subscription status values returned by the Stripe API
-    public static final String SUBSCRIPTION_STATUS_INCOMPLETE = "incomplete";
+    public static final String SUBSCRIPTION_STATUS_INCOMPLETE          = "incomplete";
+    public static final String SUBSCRIPTION_STATUS_INCOMPLETE_EXPIRED  = "incomplete_expired";
+    public static final String SUBSCRIPTION_STATUS_ACTIVE              = "active";
+    public static final String SUBSCRIPTION_STATUS_PAST_DUE            = "past_due";
+    public static final String SUBSCRIPTION_STATUS_CANCELED            = "canceled";
+
+    /**
+     * Resolves a Stripe subscription ID to the APIM subscription UUID and tenant ID.
+     * Used by Fix 2 (invoice.payment_failed) and Fix 3 (customer.subscription.updated)
+     * to locate the APIM subscription that must be blocked or unblocked.
+     */
+    public static final String GET_APIM_SUBSCRIPTION_BY_STRIPE_SUB_ID =
+            "SELECT s.UUID, ms.TENANT_ID " +
+            "FROM AM_SUBSCRIPTION s " +
+            "JOIN AM_MONETIZATION_SUBSCRIPTIONS ms " +
+            "  ON ms.SUBSCRIBED_API_ID = s.API_ID " +
+            "  AND ms.SUBSCRIBED_APPLICATION_ID = s.APPLICATION_ID " +
+            "WHERE ms.SUBSCRIPTION_ID = ?";
 
     // Stripe Checkout Session — DB status values
     public static final String CHECKOUT_SESSION_STATUS_PENDING = "PENDING";
