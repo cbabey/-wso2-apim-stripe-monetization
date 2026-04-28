@@ -223,6 +223,15 @@ public class StripeMonetizationConstants {
     public static final String GET_CHECKOUT_URL_BY_WORKFLOW_REF_SQL =
             "SELECT CHECKOUT_URL FROM AM_STRIPE_CHECKOUT_SESSIONS " +
             "WHERE WORKFLOW_REFERENCE = ? AND STATUS = 'PENDING'";
+    // Billing Portal — look up the Stripe platform customer + tenant for an application UUID.
+    // AM_MONETIZATION_PLATFORM_CUSTOMERS stores one row per (subscriber, tenant).
+    // AM_APPLICATION.SUBSCRIBER_ID links the application back to its subscriber.
+    public static final String GET_STRIPE_CUSTOMER_BY_APP_UUID_SQL =
+            "SELECT pc.CUSTOMER_ID, pc.TENANT_ID " +
+            "FROM AM_MONETIZATION_PLATFORM_CUSTOMERS pc " +
+            "JOIN AM_APPLICATION app ON app.SUBSCRIBER_ID = pc.SUBSCRIBER_ID " +
+            "WHERE app.UUID = ?";
+
     public static final String INVOICE_NOW = "invoice_now";
     public static final String CANCELED = "canceled";
     public static final String ANALYTICS_ACCESS_TOKEN_PROP = "Monetization.UsagePublisher.AnalyticsAccessToken";

@@ -754,6 +754,7 @@ class Subscriptions extends React.Component {
                                                                             <SubscriptionTableData
                                                                                 key={subscription.subscriptionId}
                                                                                 subscription={subscription}
+                                                                                applicationId={applicationId}
                                                                                 handleSubscriptionDelete={
                                                                                     this.handleSubscriptionDelete
                                                                                 }

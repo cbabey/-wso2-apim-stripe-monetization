@@ -423,6 +423,47 @@ public class StripeMonetizationDAO {
         }
     }
 
+    /**
+     * Returns the Stripe platform customer ID and tenant ID for the subscriber who owns
+     * the given application UUID.
+     *
+     * <p>Used by the Billing Portal endpoint to create a Stripe Customer Portal session
+     * for the application owner, regardless of which specific API subscription triggered
+     * the portal request.
+     *
+     * @param applicationUUID Dev Portal application UUID (e.g. {@code 0d5169e1-af20-...})
+     * @return {@code String[]{customerId, tenantId}} or {@code null} if not found
+     * @throws StripeMonetizationException if a DB error occurs
+     */
+    public String[] getStripeCustomerInfoByApplicationUUID(String applicationUUID)
+            throws StripeMonetizationException {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            ps = conn.prepareStatement(
+                    StripeMonetizationConstants.GET_STRIPE_CUSTOMER_BY_APP_UUID_SQL);
+            ps.setString(1, applicationUUID);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return new String[]{
+                        rs.getString("CUSTOMER_ID"),
+                        String.valueOf(rs.getInt("TENANT_ID"))
+                };
+            }
+            return null;
+        } catch (SQLException e) {
+            String errorMessage = "Error while looking up Stripe customer "
+                    + "for application UUID: " + applicationUUID;
+            log.error(errorMessage, e);
+            throw new StripeMonetizationException(errorMessage, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+        }
+    }
+
     public String getSubscriptionUUID(int subscriptionId) throws StripeMonetizationException {
 
         Connection conn = null;

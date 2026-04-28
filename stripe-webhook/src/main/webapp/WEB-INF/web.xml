@@ -40,7 +40,8 @@
             <param-value>
                 org.wso2.apim.monetization.webhook.WebhookApi,
                 org.wso2.apim.monetization.webhook.CheckoutUrlApi,
-                org.wso2.apim.monetization.webhook.CompleteSessionApi
+                org.wso2.apim.monetization.webhook.CompleteSessionApi,
+                org.wso2.apim.monetization.webhook.BillingPortalApi
             </param-value>
         </init-param>
 
