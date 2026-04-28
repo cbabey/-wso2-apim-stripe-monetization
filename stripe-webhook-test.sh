@@ -14,14 +14,23 @@ STRIPE_SUB_ID="${1}"
 FIRE="${2}"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WEBHOOK_SECRET="REDACTED_WEBHOOK_SECRET"
-ENDPOINT="https://localhost:9443/api/am/stripe/webhook"
+# Set WEBHOOK_SECRET via environment variable or pass it as the first argument
+# before the subscription ID.
+# Example: WEBHOOK_SECRET=whsec_xxx ./stripe-webhook-test.sh sub_xxx [--fire]
+WEBHOOK_SECRET="${WEBHOOK_SECRET:-}"
+ENDPOINT="${STRIPE_WEBHOOK_ENDPOINT:-https://localhost:9443/api/am/stripe/webhook}"
 # ─────────────────────────────────────────────────────────────────────────────
 
 if [[ -z "$STRIPE_SUB_ID" ]]; then
   echo "Usage: $0 <stripe-subscription-id> [--fire]"
-  echo "  e.g. $0 sub_1TR3Iv0IpsFtSoJnErT7mwnn"
-  echo "  e.g. $0 sub_1TR3Iv0IpsFtSoJnErT7mwnn --fire"
+  echo "  e.g. WEBHOOK_SECRET=whsec_xxx $0 sub_1TR3Iv0IpsFtSoJnErT7mwnn"
+  echo "  e.g. WEBHOOK_SECRET=whsec_xxx $0 sub_1TR3Iv0IpsFtSoJnErT7mwnn --fire"
+  exit 1
+fi
+
+if [[ -z "$WEBHOOK_SECRET" ]]; then
+  echo "Error: WEBHOOK_SECRET environment variable is not set."
+  echo "  e.g. WEBHOOK_SECRET=whsec_xxx $0 $STRIPE_SUB_ID"
   exit 1
 fi
 
