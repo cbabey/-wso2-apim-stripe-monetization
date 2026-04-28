@@ -68,7 +68,8 @@ public class CompleteSessionApiServiceImpl {
 
     private static final String COL_WORKFLOW_REFERENCE = "WORKFLOW_REFERENCE";
     private static final String COL_STATUS = "STATUS";
-    private static final String STATUS_COMPLETED = "COMPLETED";
+    private static final String STATUS_COMPLETED   = "COMPLETED";
+    private static final String STATUS_IN_PROGRESS = "IN_PROGRESS";
 
     /**
      * Query to look up a checkout session by Stripe session ID.
@@ -140,6 +141,22 @@ public class CompleteSessionApiServiceImpl {
             return jsonError(Response.Status.INTERNAL_SERVER_ERROR,
                     "Failed to activate subscription — please contact support");
         } catch (WorkflowException e) {
+            // The executor throws WorkflowException when the idempotency guard prevents a
+            // double-completion. Re-query the actual DB status to tell the difference between
+            // a real failure and a benign "webhook already claimed it" race condition.
+            String[] refreshed = querySession(sessionId);
+            String refreshedStatus = refreshed != null ? refreshed[1] : null;
+            if (STATUS_COMPLETED.equals(refreshedStatus)) {
+                log.info("complete-session: session " + sessionId
+                        + " was completed concurrently by the webhook — returning OK");
+                return Response.ok("{\"status\":\"already_completed\"}").build();
+            } else if (STATUS_IN_PROGRESS.equals(refreshedStatus)) {
+                // Webhook has claimed it and is currently processing — not an error.
+                // The subscription will be activated within seconds; tell the UI to keep polling.
+                log.info("complete-session: session " + sessionId
+                        + " is being processed by the webhook path — returning accepted");
+                return Response.accepted("{\"status\":\"being_activated\"}").build();
+            }
             log.error("complete-session: workflow error completing session: " + sessionId, e);
             return jsonError(Response.Status.INTERNAL_SERVER_ERROR,
                     "Failed to activate subscription — please contact support");
