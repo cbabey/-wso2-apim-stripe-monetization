@@ -295,10 +295,16 @@ class SubscriptionTableData extends React.Component {
     /**
      * Handles the "Resume Checkout" button for subscriptions stuck in ON_HOLD.
      *
-     * Calls GET /api/am/stripe/checkout-url?subscriptionId=<UUID> to retrieve
-     * the Stripe Checkout URL for the pending session, then redirects the browser
-     * to it so the user can retry or complete their payment.
-     * If the session has expired, shows an instructional message.
+     * Two-step strategy:
+     *  1. Call complete-session with the stored Stripe session ID.
+     *     This handles the common case where the payment already went through
+     *     (card was entered, Stripe processed it) but the webhook or activation
+     *     step failed — re-triggering complete() reads the completed Stripe session
+     *     and activates the APIM subscription without needing a new checkout.
+     *  2. Only if step 1 says the session is not yet paid (non-2xx), redirect the
+     *     user to the Stripe Checkout URL so they can actually enter their card.
+     *  3. If the session is not found at all (404), the session has expired — tell
+     *     the user to delete and re-subscribe.
      */
     handleResumeCheckout() {
         const { subscription: { subscriptionId } } = this.props;
@@ -307,20 +313,52 @@ class SubscriptionTableData extends React.Component {
         fetch(`/api/am/stripe/checkout-url?subscriptionId=${encodeURIComponent(subscriptionId)}`)
             .then((res) => {
                 if (res.status === 404) {
-                    // Session expired — user must start over
+                    // No pending session in DB — session fully expired or already activated
+                    /* eslint-disable no-alert */
                     alert(
                         'Your payment session has expired.\n'
                         + 'Please delete this subscription and re-subscribe to start a new checkout.',
                     );
+                    /* eslint-enable no-alert */
                     return null;
                 }
                 return res.json();
             })
             .then((data) => {
-                if (data && data.checkoutUrl) {
-                    // Full-page redirect so Stripe Checkout works correctly
-                    window.location.href = data.checkoutUrl;
+                if (!data) return null;
+                const { checkoutUrl, sessionId } = data;
+
+                if (!sessionId) {
+                    // Older response format — just redirect
+                    if (checkoutUrl) window.location.href = checkoutUrl;
+                    return null;
                 }
+
+                // Step 1 — try to activate via the existing Stripe session.
+                // If the payment already went through (card was entered) this will
+                // succeed and activate the subscription without a new checkout page.
+                return fetch(
+                    `/api/am/stripe/complete-session?session_id=${encodeURIComponent(sessionId)}`,
+                    { method: 'POST' },
+                ).then((completeRes) => {
+                    if (completeRes.ok) {
+                        // Activation succeeded (or was already in progress) — reload
+                        // so the subscription table reflects the new UNBLOCKED status.
+                        window.location.reload();
+                    } else {
+                        // Step 2 — session not yet paid in Stripe; send user to checkout.
+                        if (checkoutUrl) {
+                            window.location.href = checkoutUrl;
+                        } else {
+                            /* eslint-disable no-alert */
+                            alert(
+                                'Your payment session has expired.\n'
+                                + 'Please delete this subscription and re-subscribe.',
+                            );
+                            /* eslint-enable no-alert */
+                        }
+                    }
+                });
             })
             .catch((err) => {
                 console.error('resume-checkout: request failed', err);
