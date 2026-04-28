@@ -74,6 +74,7 @@ class SubscriptionTableData extends React.Component {
             isWebhookAPI: false,
             callbackLinkAnchor: null,
             manageBillingLoading: false,
+            resumeCheckoutLoading: false,
         };
         this.handleRequestClose = this.handleRequestClose.bind(this);
         this.handleRequestOpen = this.handleRequestOpen.bind(this);
@@ -89,6 +90,7 @@ class SubscriptionTableData extends React.Component {
         this.handleOpenCallbackURLs = this.handleOpenCallbackURLs.bind(this);
         this.handleCloseCallbackURLs = this.handleCloseCallbackURLs.bind(this);
         this.handleManageBilling = this.handleManageBilling.bind(this);
+        this.handleResumeCheckout = this.handleResumeCheckout.bind(this);
     }
 
     componentDidMount() {
@@ -291,6 +293,44 @@ class SubscriptionTableData extends React.Component {
     }
 
     /**
+     * Handles the "Resume Checkout" button for subscriptions stuck in ON_HOLD.
+     *
+     * Calls GET /api/am/stripe/checkout-url?subscriptionId=<UUID> to retrieve
+     * the Stripe Checkout URL for the pending session, then redirects the browser
+     * to it so the user can retry or complete their payment.
+     * If the session has expired, shows an instructional message.
+     */
+    handleResumeCheckout() {
+        const { subscription: { subscriptionId } } = this.props;
+        this.setState({ resumeCheckoutLoading: true });
+
+        fetch(`/api/am/stripe/checkout-url?subscriptionId=${encodeURIComponent(subscriptionId)}`)
+            .then((res) => {
+                if (res.status === 404) {
+                    // Session expired — user must start over
+                    alert(
+                        'Your payment session has expired.\n'
+                        + 'Please delete this subscription and re-subscribe to start a new checkout.',
+                    );
+                    return null;
+                }
+                return res.json();
+            })
+            .then((data) => {
+                if (data && data.checkoutUrl) {
+                    // Full-page redirect so Stripe Checkout works correctly
+                    window.location.href = data.checkoutUrl;
+                }
+            })
+            .catch((err) => {
+                console.error('resume-checkout: request failed', err);
+            })
+            .finally(() => {
+                this.setState({ resumeCheckoutLoading: false });
+            });
+    }
+
+    /**
     * @inheritdoc
     * @memberof SubscriptionTableData
     */
@@ -302,7 +342,7 @@ class SubscriptionTableData extends React.Component {
         } = this.props;
         const {
             openMenu, isMonetizedAPI, isDynamicUsagePolicy, openMenuEdit, selectedTier, tiers,
-            isWebhookAPI, callbackLinkAnchor, manageBillingLoading,
+            isWebhookAPI, callbackLinkAnchor, manageBillingLoading, resumeCheckoutLoading,
         } = this.state;
         const isSubValidationDisabled = tiers && tiers.length === 1
             && tiers[0].value.includes(CONSTANTS.DEFAULT_SUBSCRIPTIONLESS_PLAN);
@@ -628,11 +668,41 @@ class SubscriptionTableData extends React.Component {
                                 isDynamicUsagePolicy={isDynamicUsagePolicy}
                             />
                         )}
-                        {/* Manage Billing button — visible for all monetized subscriptions.
-                            Opens the Stripe Customer Portal in a new tab so the user can
-                            update their payment method, view invoices, or manage their plan.
-                            Particularly useful when status is BLOCKED due to payment failure. */}
-                        {isMonetizedAPI && (
+                        {/* ON_HOLD: payment never completed on the initial checkout.
+                            Show "Resume Checkout" so the user can go back to Stripe and
+                            retry — or learn the session has expired and must re-subscribe. */}
+                        {isMonetizedAPI && status === 'ON_HOLD' && (
+                            <Tooltip
+                                title={(
+                                    <FormattedMessage
+                                        id='Applications.Details.SubscriptionTableData.resume.checkout.tooltip'
+                                        defaultMessage='Your payment is incomplete. Click to return to the Stripe payment page.'
+                                    />
+                                )}
+                            >
+                                <span>
+                                    <Button
+                                        id={'resume-checkout-' + apiId}
+                                        color='warning'
+                                        onClick={this.handleResumeCheckout}
+                                        disabled={resumeCheckoutLoading}
+                                        startIcon={resumeCheckoutLoading
+                                            ? <CircularProgress size={14} />
+                                            : <PaymentIcon />}
+                                        size='small'
+                                    >
+                                        <FormattedMessage
+                                            id='Applications.Details.SubscriptionTableData.resume.checkout'
+                                            defaultMessage='Resume Checkout'
+                                        />
+                                    </Button>
+                                </span>
+                            </Tooltip>
+                        )}
+                        {/* Manage Billing — shown only when a Stripe billing account exists
+                            (i.e. checkout completed at least once). ON_HOLD is excluded because
+                            no shared customer record exists yet so the portal would error. */}
+                        {isMonetizedAPI && status !== 'ON_HOLD' && (
                             <Tooltip
                                 title={(
                                     <FormattedMessage

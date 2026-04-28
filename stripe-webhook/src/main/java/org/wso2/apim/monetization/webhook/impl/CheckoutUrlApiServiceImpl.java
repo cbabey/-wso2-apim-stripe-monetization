@@ -44,12 +44,19 @@ public class CheckoutUrlApiServiceImpl {
     private static final String COL_CHECKOUT_URL = "CHECKOUT_URL";
 
     /**
-     * SQL to retrieve the checkout URL for a pending session by workflow reference
-     * (= APIM subscription ID).
+     * SQL to retrieve the checkout URL for a pending session by APIM subscription UUID.
+     *
+     * <p>AM_STRIPE_CHECKOUT_SESSIONS.WORKFLOW_REFERENCE stores the numeric SUBSCRIPTION_ID
+     * as a string, so we join AM_SUBSCRIPTION on CAST(SUBSCRIPTION_ID AS CHAR) to look up
+     * by the subscription UUID that the Dev Portal API exposes.
      */
-    private static final String GET_CHECKOUT_URL_SQL =
-            "SELECT CHECKOUT_URL FROM AM_STRIPE_CHECKOUT_SESSIONS " +
-            "WHERE WORKFLOW_REFERENCE = ? AND STATUS = 'PENDING'";
+    private static final String GET_CHECKOUT_URL_BY_SUB_UUID_SQL =
+            "SELECT cs.CHECKOUT_URL " +
+            "FROM AM_STRIPE_CHECKOUT_SESSIONS cs " +
+            "JOIN AM_SUBSCRIPTION sub " +
+            "  ON cs.WORKFLOW_REFERENCE = CAST(sub.SUBSCRIPTION_ID AS CHAR) " +
+            "WHERE sub.UUID = ? " +
+            "  AND cs.STATUS = 'PENDING'";
 
     // -------------------------------------------------------------------------
 
@@ -82,7 +89,7 @@ public class CheckoutUrlApiServiceImpl {
         ResultSet rs = null;
         try {
             conn = APIMgtDBUtil.getConnection();
-            ps = conn.prepareStatement(GET_CHECKOUT_URL_SQL);
+            ps = conn.prepareStatement(GET_CHECKOUT_URL_BY_SUB_UUID_SQL);
             ps.setString(1, subscriptionId);
             rs = ps.executeQuery();
             if (rs.next()) {
@@ -90,7 +97,7 @@ public class CheckoutUrlApiServiceImpl {
             }
             return null;
         } catch (SQLException e) {
-            log.error("Failed to retrieve checkout URL for subscriptionId: " + subscriptionId, e);
+            log.error("Failed to retrieve checkout URL for subscription UUID: " + subscriptionId, e);
             return null;
         } finally {
             APIMgtDBUtil.closeAllConnections(ps, conn, rs);
