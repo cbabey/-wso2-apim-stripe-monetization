@@ -424,18 +424,18 @@ public class StripeMonetizationDAO {
     }
 
     /**
-     * Returns the Stripe platform customer ID and tenant ID for the subscriber who owns
-     * the given application UUID.
+     * Returns the Stripe shared customer ID, tenant ID, and one API UUID for the application.
      *
-     * <p>Used by the Billing Portal endpoint to create a Stripe Customer Portal session
-     * for the application owner, regardless of which specific API subscription triggered
-     * the portal request.
+     * <p>Subscriptions and invoices in Stripe Connect live on the <em>shared customer</em>
+     * (inside the connected account), not on the platform customer. This method joins
+     * {@code AM_MONETIZATION_SHARED_CUSTOMERS}, {@code AM_MONETIZATION_SUBSCRIPTIONS}, and
+     * {@code AM_API} to retrieve everything the Billing Portal endpoint needs in one query.
      *
      * @param applicationUUID Dev Portal application UUID (e.g. {@code 0d5169e1-af20-...})
-     * @return {@code String[]{customerId, tenantId}} or {@code null} if not found
+     * @return {@code String[]{stripeCustomerId, tenantId, apiUuid}} or {@code null} if not found
      * @throws StripeMonetizationException if a DB error occurs
      */
-    public String[] getStripeCustomerInfoByApplicationUUID(String applicationUUID)
+    public String[] getSharedCustomerAndApiByApplicationUUID(String applicationUUID)
             throws StripeMonetizationException {
 
         Connection conn = null;
@@ -444,18 +444,19 @@ public class StripeMonetizationDAO {
         try {
             conn = APIMgtDBUtil.getConnection();
             ps = conn.prepareStatement(
-                    StripeMonetizationConstants.GET_STRIPE_CUSTOMER_BY_APP_UUID_SQL);
+                    StripeMonetizationConstants.GET_SHARED_CUSTOMER_AND_API_BY_APP_UUID_SQL);
             ps.setString(1, applicationUUID);
             rs = ps.executeQuery();
             if (rs.next()) {
                 return new String[]{
-                        rs.getString("CUSTOMER_ID"),
-                        String.valueOf(rs.getInt("TENANT_ID"))
+                        rs.getString("STRIPE_CUSTOMER_ID"),
+                        String.valueOf(rs.getInt("TENANT_ID")),
+                        rs.getString("API_UUID")
                 };
             }
             return null;
         } catch (SQLException e) {
-            String errorMessage = "Error while looking up Stripe customer "
+            String errorMessage = "Error while looking up shared Stripe customer "
                     + "for application UUID: " + applicationUUID;
             log.error(errorMessage, e);
             throw new StripeMonetizationException(errorMessage, e);

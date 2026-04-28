@@ -223,14 +223,20 @@ public class StripeMonetizationConstants {
     public static final String GET_CHECKOUT_URL_BY_WORKFLOW_REF_SQL =
             "SELECT CHECKOUT_URL FROM AM_STRIPE_CHECKOUT_SESSIONS " +
             "WHERE WORKFLOW_REFERENCE = ? AND STATUS = 'PENDING'";
-    // Billing Portal — look up the Stripe platform customer + tenant for an application UUID.
-    // AM_MONETIZATION_PLATFORM_CUSTOMERS stores one row per (subscriber, tenant).
-    // AM_APPLICATION.SUBSCRIBER_ID links the application back to its subscriber.
-    public static final String GET_STRIPE_CUSTOMER_BY_APP_UUID_SQL =
-            "SELECT pc.CUSTOMER_ID, pc.TENANT_ID " +
-            "FROM AM_MONETIZATION_PLATFORM_CUSTOMERS pc " +
-            "JOIN AM_APPLICATION app ON app.SUBSCRIBER_ID = pc.SUBSCRIBER_ID " +
-            "WHERE app.UUID = ?";
+    // Billing Portal — look up the Stripe *shared* customer ID, tenant ID, and one API UUID
+    // for the given application UUID.  Subscriptions and invoices live on the shared customer
+    // (in the connected account), not on the platform customer.
+    // AM_MONETIZATION_SUBSCRIPTIONS.SHARED_CUSTOMER_ID is the FK to AM_MONETIZATION_SHARED_CUSTOMERS.ID.
+    public static final String GET_SHARED_CUSTOMER_AND_API_BY_APP_UUID_SQL =
+            "SELECT sc.SHARED_CUSTOMER_ID AS STRIPE_CUSTOMER_ID, sc.TENANT_ID, api.API_UUID " +
+            "FROM AM_MONETIZATION_SHARED_CUSTOMERS sc " +
+            "JOIN AM_APPLICATION app ON app.APPLICATION_ID = sc.APPLICATION_ID " +
+            "JOIN AM_MONETIZATION_SUBSCRIPTIONS ms " +
+            "  ON ms.SUBSCRIBED_APPLICATION_ID = sc.APPLICATION_ID " +
+            "  AND ms.SHARED_CUSTOMER_ID = sc.ID " +
+            "JOIN AM_API api ON api.API_ID = ms.SUBSCRIBED_API_ID " +
+            "WHERE app.UUID = ? " +
+            "LIMIT 1";
 
     public static final String INVOICE_NOW = "invoice_now";
     public static final String CANCELED = "canceled";
