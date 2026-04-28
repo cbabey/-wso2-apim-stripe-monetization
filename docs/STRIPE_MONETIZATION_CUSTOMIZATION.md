@@ -794,15 +794,15 @@ Stripe signs every webhook delivery with HMAC-SHA256. The verification logic (im
 
 ```mermaid
 flowchart TD
-    A[POST /api/am/stripe/webhook] --> B{Stripe-Signature<br/>header present?}
+    A[POST /api/am/stripe/webhook] --> B{Stripe Signature header present?}
     B -- No --> Z1[400 Bad Request]
-    B -- Yes --> C{Webhook secret<br/>configured?}
+    B -- Yes --> C{Webhook secret configured?}
     C -- No --> Z2[500 Internal Server Error]
-    C -- Yes --> D[Parse header:<br/>t=timestamp, v1=signature]
-    D --> E{timestamp within<br/>±5 minute window?}
+    C -- Yes --> D[Parse header: t=timestamp, v1=signature]
+    D --> E{Timestamp within 5 min window?}
     E -- No --> Z3[400 Replay Attack Rejected]
-    E -- Yes --> F[Compute<br/>HMAC-SHA256 of<br/>timestamp.payload<br/>using webhookSecret]
-    F --> G{computedSig<br/>== v1 signature?}
+    E -- Yes --> F[Compute HMAC SHA256 of timestamp.payload using secret]
+    F --> G{Signature matches?}
     G -- No --> Z4[400 Invalid Signature]
     G -- Yes --> H[Parse event JSON<br/>with Jackson]
     H --> I{event.type?}
