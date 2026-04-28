@@ -20,6 +20,7 @@ package org.wso2.apim.monetization.impl.workflow;
 
 import com.google.gson.Gson;
 import com.stripe.Stripe;
+import com.stripe.exception.InvalidRequestException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Customer;
 import com.stripe.model.PaymentMethod;
@@ -283,7 +284,106 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                 }
             }
             //creating Subscriptions
-            createMonetizedSubscriptions(planId, monetizationSharedCustomer, requestOptions, subWorkFlowDTO, api.getUuid());
+            try {
+                createMonetizedSubscriptions(planId, monetizationSharedCustomer,
+                        requestOptions, subWorkFlowDTO, api.getUuid());
+            } catch (WorkflowException payDeclinedEx) {
+                if (payDeclinedEx.getMessage() != null
+                        && payDeclinedEx.getMessage().startsWith("STRIPE_PAYMENT_DECLINED:")) {
+                    // The card on file failed for subscription charging. Fall back to a new Stripe
+                    // Checkout Session so the user can provide a working payment method.
+                    // Cancel the orphaned incomplete Stripe subscription first so it doesn't
+                    // show as a pending invoice in the Stripe Customer Portal.
+                    String orphanedSubId = extractStripeSubId(payDeclinedEx.getMessage());
+                    if (orphanedSubId != null) {
+                        try {
+                            Subscription.retrieve(orphanedSubId, requestOptions)
+                                    .cancel((Map<String, Object>) null, requestOptions);
+                            log.info("monetizeSubscription: cancelled orphaned incomplete Stripe"
+                                    + " subscription=" + orphanedSubId
+                                    + " for Application: " + subWorkFlowDTO.getApplicationName());
+                        } catch (StripeException cancelEx) {
+                            log.warn("monetizeSubscription: could not cancel orphaned Stripe"
+                                    + " subscription=" + orphanedSubId, cancelEx);
+                        }
+                    }
+                    // Before falling back to Checkout, try once with the platform customer's
+                    // current default PM. This handles the case where the shared customer was
+                    // stale (created in a prior failed attempt) but the subscriber already has
+                    // a valid card on file on the platform customer.
+                    boolean retrySucceeded = false;
+                    try {
+                        MonetizationPlatformCustomer platCust = stripeMonetizationDAO
+                                .getPlatformCustomer(subscriber.getId(), subscriber.getTenantId());
+                        if (platCust != null && !StringUtils.isEmpty(platCust.getCustomerId())) {
+                            String retryPmId = getDefaultPaymentMethodId(platCust.getCustomerId());
+                            if (retryPmId != null) {
+                                MonetizationSharedCustomer freshShared =
+                                        createSharedCustomerWithPaymentMethod(
+                                                subscriber.getEmail(), platCust, retryPmId,
+                                                requestOptions, subWorkFlowDTO);
+                                createMonetizedSubscriptions(planId, freshShared,
+                                        requestOptions, subWorkFlowDTO, api.getUuid());
+                                retrySucceeded = true;
+                                log.info("monetizeSubscription: PM retry succeeded for Application: "
+                                        + subWorkFlowDTO.getApplicationName());
+                            }
+                        }
+                    } catch (WorkflowException retryEx) {
+                        if (retryEx.getMessage() != null
+                                && retryEx.getMessage().startsWith("STRIPE_PAYMENT_DECLINED:")) {
+                            String retryOrphanId = extractStripeSubId(retryEx.getMessage());
+                            if (retryOrphanId != null) {
+                                try {
+                                    Subscription.retrieve(retryOrphanId, requestOptions)
+                                            .cancel((Map<String, Object>) null, requestOptions);
+                                } catch (StripeException cancelRetryEx) {
+                                    log.warn("monetizeSubscription: could not cancel retry orphaned"
+                                            + " subscription=" + retryOrphanId, cancelRetryEx);
+                                }
+                            }
+                        }
+                        log.warn("monetizeSubscription: PM retry failed, falling back to Checkout"
+                                + " for Application: " + subWorkFlowDTO.getApplicationName(),
+                                retryEx);
+                    } catch (Exception retryEx) {
+                        log.warn("monetizeSubscription: PM retry error, falling back to Checkout"
+                                + " for Application: " + subWorkFlowDTO.getApplicationName(),
+                                retryEx);
+                    }
+                    if (retrySucceeded) {
+                        return execute(workflowDTO);
+                    }
+                    log.warn("monetizeSubscription: payment declined for Application: "
+                            + subWorkFlowDTO.getApplicationName()
+                            + " — falling back to Stripe Checkout for card re-entry");
+                    String currency = null;
+                    try {
+                        currency = Plan.retrieve(planId, requestOptions).getCurrency();
+                    } catch (StripeException stripeEx) {
+                        log.warn("Could not retrieve plan currency for Checkout fallback", stripeEx);
+                    }
+                    Session checkoutSession = createCheckoutSession(
+                            subscriber, subWorkFlowDTO, api.getUuid(), currency);
+                    stripeMonetizationDAO.saveCheckoutSession(
+                            checkoutSession.getId(),
+                            subWorkFlowDTO.getWorkflowReference(),
+                            subscriber.getId(),
+                            subWorkFlowDTO.getTenantId(),
+                            api.getUuid(),
+                            checkoutSession.getUrl());
+                    workflowDTO.setProperties(StripeMonetizationConstants.CHECKOUT_URL_PROPERTY,
+                            checkoutSession.getUrl());
+                    workflowDTO.setProperties(StripeMonetizationConstants.CHECKOUT_SESSION_ID_PROPERTY,
+                            checkoutSession.getId());
+                    workflowDTO.setStatus(WorkflowStatus.CREATED);
+                    super.execute(workflowDTO);
+                    HttpWorkflowResponse httpWorkflowResponse = new HttpWorkflowResponse();
+                    httpWorkflowResponse.setRedirectUrl(checkoutSession.getUrl());
+                    return httpWorkflowResponse;
+                }
+                throw payDeclinedEx;
+            }
         } catch (APIManagementException e) {
             String errorMessage = "Could not monetize subscription for API : " + subWorkFlowDTO.getApiName()
                     + " by Application : " + subWorkFlowDTO.getApplicationName();
@@ -645,18 +745,25 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
             }
             // Fix 1: Stripe does not throw an exception when the initial invoice payment
             // fails — it silently creates the subscription with status "incomplete".
-            // Detect this and abort so the APIM subscription is never set to UNBLOCKED.
+            // Detect this, save the subscription ID to the DB (so Fix 3's
+            // customer.subscription.updated handler can unblock the APIM subscription when
+            // Stripe eventually retries and collects payment), and signal payment decline to
+            // the caller via a STRIPE_PAYMENT_DECLINED: prefix on the exception message.
             if (StripeMonetizationConstants.SUBSCRIPTION_STATUS_INCOMPLETE.equals(subscription.getStatus())) {
-                try {
-                    subscription.cancel((Map<String, Object>) null, requestOptions);
-                } catch (StripeException cancelEx) {
-                    log.error("Failed to cancel incomplete Stripe subscription " + subscription.getId()
-                            + " for Application : " + subWorkFlowDTO.getApplicationName(), cancelEx);
-                }
-                String errorMsg = "Initial payment failed for Application : " + subWorkFlowDTO.getApplicationName()
+                // Do NOT save to DB and do NOT cancel here.
+                //  • completeStripeCheckoutSubscription extracts the ID and saves it so
+                //    Fix 3 (customer.subscription.updated) can track the retry.
+                //  • monetizeSubscription falls back to a fresh Stripe Checkout Session
+                //    so the user can provide a working card.
+                // The Stripe subscription ID is embedded in the message (format:
+                //   STRIPE_PAYMENT_DECLINED:<subId>: <human-readable text>)
+                // so callers can extract it without a new exception class.
+                String errorMsg = "STRIPE_PAYMENT_DECLINED:" + subscription.getId()
+                        + ": Initial payment failed for Application: "
+                        + subWorkFlowDTO.getApplicationName()
                         + ". Stripe subscription " + subscription.getId()
-                        + " was incomplete and has been cancelled.";
-                log.error(errorMsg);
+                        + " is incomplete — Stripe will retry payment automatically.";
+                log.warn(errorMsg);
                 throw new WorkflowException(errorMsg);
             }
             try {
@@ -770,12 +877,30 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                 try {
                     completeStripeCheckoutSubscription(workflowDTO, checkoutSessionId);
                 } catch (WorkflowException e) {
-                    // Reset the claim so the other path (webhook or browser-redirect) can retry.
-                    try {
-                        stripeMonetizationDAO.resetCheckoutSessionClaim(checkoutSessionId);
-                    } catch (StripeMonetizationException resetEx) {
-                        log.error("Failed to reset claim for session " + checkoutSessionId
-                                + " after completion error", resetEx);
+                    if (e.getMessage() != null
+                            && e.getMessage().startsWith("STRIPE_PAYMENT_DECLINED:")) {
+                        // Stripe declined the initial subscription payment. The subscription ID
+                        // was saved to the DB so Fix 3 (customer.subscription.updated) can
+                        // unblock the APIM subscription when Stripe retries successfully.
+                        // Mark the checkout session COMPLETED so complete-session no longer
+                        // treats it as retryable — further activation will come from Fix 3.
+                        try {
+                            stripeMonetizationDAO.updateCheckoutSessionStatus(
+                                    checkoutSessionId,
+                                    StripeMonetizationConstants.CHECKOUT_SESSION_STATUS_COMPLETED);
+                        } catch (StripeMonetizationException markEx) {
+                            log.error("Failed to mark session COMPLETED after payment decline"
+                                    + " for session: " + checkoutSessionId, markEx);
+                        }
+                    } else {
+                        // Other errors: reset the claim to PENDING so the other path
+                        // (webhook or browser-redirect) can retry activation.
+                        try {
+                            stripeMonetizationDAO.resetCheckoutSessionClaim(checkoutSessionId);
+                        } catch (StripeMonetizationException resetEx) {
+                            log.error("Failed to reset claim for session " + checkoutSessionId
+                                    + " after completion error", resetEx);
+                        }
                     }
                     throw e;
                 }
@@ -898,8 +1023,38 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
             try (Connection con = APIMgtDBUtil.getConnection()) {
                 int apiId = ApiMgtDAO.getInstance().getAPIID(apiUuid, con);
                 String planId = stripeMonetizationDAO.getBillingEnginePlanIdForTier(apiId, tierName);
-                createMonetizedSubscriptions(planId, sharedCustomer, requestOptions,
-                        subWorkflowDTO, apiUuid);
+                try {
+                    createMonetizedSubscriptions(planId, sharedCustomer, requestOptions,
+                            subWorkflowDTO, apiUuid);
+                } catch (WorkflowException wfEx) {
+                    if (wfEx.getMessage() != null
+                            && wfEx.getMessage().startsWith("STRIPE_PAYMENT_DECLINED:")) {
+                        // Payment declined: save the incomplete subscription to the DB so Fix 3
+                        // (customer.subscription.updated) can unblock the APIM subscription when
+                        // Stripe eventually collects payment.
+                        // Message format: "STRIPE_PAYMENT_DECLINED:<stripeSubId>: <text>"
+                        String stripeSubId = extractStripeSubId(wfEx.getMessage());
+                        if (stripeSubId != null) {
+                            APIIdentifier identifier = new APIIdentifier(
+                                    subWorkflowDTO.getApiProvider(),
+                                    subWorkflowDTO.getApiName(),
+                                    subWorkflowDTO.getApiVersion());
+                            try {
+                                stripeMonetizationDAO.addBESubscription(
+                                        identifier,
+                                        subWorkflowDTO.getApplicationId(),
+                                        subWorkflowDTO.getTenantId(),
+                                        sharedCustomer.getId(),
+                                        stripeSubId,
+                                        apiUuid);
+                            } catch (StripeMonetizationException dbEx) {
+                                log.error("Failed to save incomplete Stripe subscription "
+                                        + stripeSubId + " to DB — Fix 3 cannot track it", dbEx);
+                            }
+                        }
+                    }
+                    throw wfEx; // propagates to complete() which handles the marker
+                }
             }
 
             // 10. Mark the checkout session record as completed
@@ -1021,12 +1176,31 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
      * Creates a Stripe Platform Customer attached to a real payment method collected via
      * Stripe Checkout (replaces the legacy {@code tok_visa} approach in
      * {@link #createMonetizationPlatformCutomer}).
+     *
+     * <p>Idempotent: if a platform customer for this subscriber already exists in the DB
+     * (from a previous partial run), it is reused rather than creating a duplicate in Stripe.
+     * If Stripe reports the payment method was already attached (server crashed between
+     * {@code Customer.create()} and the DB insert in a previous run), the customer is
+     * recovered via {@code PaymentMethod.retrieve()} and saved to the DB so subsequent
+     * retries hit the fast DB path instead.
      */
     private MonetizationPlatformCustomer createPlatformCustomerWithPaymentMethod(
             Subscriber subscriber, String paymentMethodId) throws WorkflowException {
 
         MonetizationPlatformCustomer monetizationPlatformCustomer = new MonetizationPlatformCustomer();
         try {
+            // Idempotency guard: reuse existing platform customer if one was already persisted
+            // to the DB by an earlier (partial) run of completeStripeCheckoutSubscription().
+            MonetizationPlatformCustomer existing =
+                    stripeMonetizationDAO.getPlatformCustomer(
+                            subscriber.getId(), subscriber.getTenantId());
+            if (!StringUtils.isEmpty(existing.getCustomerId())) {
+                log.info("createPlatformCustomerWithPaymentMethod: reusing existing Stripe"
+                        + " platform customer=" + existing.getCustomerId()
+                        + " for subscriber=" + subscriber.getName());
+                return existing;
+            }
+
             Map<String, Object> customerParams = new HashMap<>();
             if (!StringUtils.isEmpty(subscriber.getEmail())) {
                 customerParams.put(StripeMonetizationConstants.CUSTOMER_EMAIL, subscriber.getEmail());
@@ -1046,6 +1220,46 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
                     subscriber.getId(), subscriber.getTenantId(), customer.getId());
             monetizationPlatformCustomer.setId(id);
 
+        } catch (InvalidRequestException ex) {
+            // Stripe rejects Customer.create when the payment method is already attached to an
+            // existing Stripe customer. This happens when a previous run called Customer.create
+            // successfully but then crashed before the DB insert completed. Recover by reading
+            // the customer ID off the payment method object and persisting it to the DB.
+            if (ex.getMessage() != null && ex.getMessage().contains("already been attached")) {
+                log.warn("createPlatformCustomerWithPaymentMethod: payment method "
+                        + paymentMethodId + " already attached to a Stripe customer"
+                        + " — recovering existing customer for subscriber=" + subscriber.getName());
+                try {
+                    PaymentMethod pm = PaymentMethod.retrieve(paymentMethodId);
+                    String recoveredCustomerId = pm.getCustomer();
+                    if (StringUtils.isEmpty(recoveredCustomerId)) {
+                        throw new WorkflowException(
+                                "Payment method " + paymentMethodId
+                                + " already attached but getCustomer() returned empty — "
+                                + "cannot recover platform customer for " + subscriber.getName());
+                    }
+                    int id = stripeMonetizationDAO.addBEPlatformCustomer(
+                            subscriber.getId(), subscriber.getTenantId(), recoveredCustomerId);
+                    monetizationPlatformCustomer.setCustomerId(recoveredCustomerId);
+                    monetizationPlatformCustomer.setId(id);
+                    log.info("createPlatformCustomerWithPaymentMethod: recovered Stripe platform"
+                            + " customer=" + recoveredCustomerId
+                            + " for subscriber=" + subscriber.getName());
+                } catch (StripeException stripeEx) {
+                    throw new WorkflowException(
+                            "Failed to retrieve Stripe payment method during recovery: "
+                            + paymentMethodId, stripeEx);
+                } catch (StripeMonetizationException dbEx) {
+                    throw new WorkflowException(
+                            "Failed to save recovered Stripe platform customer to DB for: "
+                            + subscriber.getName(), dbEx);
+                }
+            } else {
+                String errorMsg = "Error creating Stripe platform customer for: "
+                        + subscriber.getName();
+                log.error(errorMsg, ex);
+                throw new WorkflowException(errorMsg, ex);
+            }
         } catch (StripeException ex) {
             String errorMsg = "Error creating Stripe platform customer for: " + subscriber.getName();
             log.error(errorMsg, ex);
@@ -1120,6 +1334,22 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
             throw new WorkflowException(errorMsg, ex);
         }
         return monetizationSharedCustomer;
+    }
+
+    /**
+     * Parses the Stripe subscription ID embedded in a STRIPE_PAYMENT_DECLINED message.
+     *
+     * <p>Message format: {@code "STRIPE_PAYMENT_DECLINED:<stripeSubId>: <human-readable text>"}
+     *
+     * @return the Stripe subscription ID (e.g. {@code sub_xxx}), or {@code null} if not parseable
+     */
+    private String extractStripeSubId(String message) {
+        if (message == null) {
+            return null;
+        }
+        // Split on ":" with a limit of 3 so the human-readable part after the second colon is untouched.
+        String[] parts = message.split(":", 3);
+        return (parts.length >= 2 && !parts[1].trim().isEmpty()) ? parts[1].trim() : null;
     }
 
 }

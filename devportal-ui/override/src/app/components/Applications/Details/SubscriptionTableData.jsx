@@ -345,18 +345,28 @@ class SubscriptionTableData extends React.Component {
                         // Activation succeeded (or was already in progress) — reload
                         // so the subscription table reflects the new UNBLOCKED status.
                         window.location.reload();
+                    } else if (completeRes.status === 402) {
+                        // Stripe subscription payment declined. The subscription ID was saved
+                        // to the DB; Stripe will retry automatically.
+                        /* eslint-disable no-alert */
+                        alert(
+                            'Your initial payment was declined.\n'
+                            + 'Stripe will retry automatically.\n'
+                            + 'You can also delete this subscription and re-subscribe'
+                            + ' with a different card.',
+                        );
+                        /* eslint-enable no-alert */
+                    } else if (checkoutUrl) {
+                        // Other failure — the Stripe Checkout may not have been completed
+                        // yet; redirect so the user can finish entering their card.
+                        window.location.href = checkoutUrl;
                     } else {
-                        // Step 2 — session not yet paid in Stripe; send user to checkout.
-                        if (checkoutUrl) {
-                            window.location.href = checkoutUrl;
-                        } else {
-                            /* eslint-disable no-alert */
-                            alert(
-                                'Your payment session has expired.\n'
-                                + 'Please delete this subscription and re-subscribe.',
-                            );
-                            /* eslint-enable no-alert */
-                        }
+                        /* eslint-disable no-alert */
+                        alert(
+                            'Your payment session has expired.\n'
+                            + 'Please delete this subscription and re-subscribe.',
+                        );
+                        /* eslint-enable no-alert */
                     }
                 });
             })

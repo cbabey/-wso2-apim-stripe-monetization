@@ -141,6 +141,21 @@ public class CompleteSessionApiServiceImpl {
             return jsonError(Response.Status.INTERNAL_SERVER_ERROR,
                     "Failed to activate subscription — please contact support");
         } catch (WorkflowException e) {
+            // Stripe declined the initial subscription payment.  The subscription ID was saved
+            // to the DB so Fix 3 (customer.subscription.updated) activates the APIM subscription
+            // when Stripe retries and collects payment.  Return 402 so the UI shows a
+            // payment-declined message instead of redirecting to the already-consumed checkout URL.
+            if (e.getMessage() != null && e.getMessage().startsWith("STRIPE_PAYMENT_DECLINED:")) {
+                log.warn("complete-session: Stripe payment declined for session=" + sessionId
+                        + " — subscription saved, awaiting Stripe automatic retry");
+                return Response.status(Response.Status.PAYMENT_REQUIRED)
+                        .entity("{\"error\":\"payment_declined\","
+                                + "\"message\":\"Your initial payment was declined."
+                                + " Stripe will retry automatically."
+                                + " You can also delete this subscription and re-subscribe"
+                                + " with a different card.\"}")
+                        .build();
+            }
             // The executor throws WorkflowException when the idempotency guard prevents a
             // double-completion. Re-query the actual DB status to tell the difference between
             // a real failure and a benign "webhook already claimed it" race condition.

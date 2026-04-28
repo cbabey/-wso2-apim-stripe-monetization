@@ -75,7 +75,8 @@ public class StripeMonetizationConstants {
                     " ID, SHARED_CUSTOMER_ID" +
                     " FROM AM_MONETIZATION_SHARED_CUSTOMERS" +
                     " WHERE" +
-                    " APPLICATION_ID=? AND API_PROVIDER=? AND TENANT_ID=?";
+                    " APPLICATION_ID=? AND API_PROVIDER=? AND TENANT_ID=?" +
+                    " ORDER BY ID DESC LIMIT 1";
 
     public static final String GET_BE_SUBSCRIPTION_SQL =
             " SELECT" +
@@ -236,6 +237,7 @@ public class StripeMonetizationConstants {
             "  AND ms.SHARED_CUSTOMER_ID = sc.ID " +
             "JOIN AM_API api ON api.API_ID = ms.SUBSCRIBED_API_ID " +
             "WHERE app.UUID = ? " +
+            "ORDER BY sc.ID DESC " +
             "LIMIT 1";
 
     public static final String INVOICE_NOW = "invoice_now";

@@ -4,7 +4,7 @@
 
 This document describes:
 1. How the **default** WSO2 APIM Stripe monetization subscription workflow operates out-of-the-box.
-2. The **custom enhancements** implemented to support real payment method collection via Stripe Checkout, browser redirection, webhook-driven workflow resumption, parallel browser-redirect completion, and multi-application subscriber support.
+2. The **custom enhancements** implemented to support real payment method collection via Stripe Checkout, browser redirection, webhook-driven workflow resumption, parallel browser-redirect completion, payment failure handling, gateway enforcement, and multi-application subscriber support.
 
 ---
 
@@ -142,6 +142,7 @@ sequenceDiagram
 | **Synchronous — no user interaction** | The subscriber is never asked for their payment details. |
 | **Not production-ready for billing** | Stripe subscriptions created this way cannot charge real customers. |
 | **No redirect mechanism** | The workflow always returns `GeneralWorkflowResponse` which results in `status: UNBLOCKED` immediately — no way to pause the flow for external input. |
+| **No payment failure handling** | If a card is declined or a recurring invoice fails, the APIM subscription remains active — API access is never blocked. |
 
 ---
 
@@ -152,8 +153,11 @@ sequenceDiagram
 1. Collect **real payment methods** from new subscribers using Stripe's hosted Checkout page.
 2. **Redirect** the subscriber's browser to Stripe Checkout during the subscription flow.
 3. **Resume** the APIM subscription workflow automatically after the subscriber enters their card via **two parallel paths** — Stripe webhook and browser redirect — with a first-one-wins idempotency guard.
-4. Support subscribers with **multiple applications** subscribing to APIs (reuse existing payment method).
+4. Support subscribers with **multiple applications** subscribing to APIs (reuse existing payment method without re-entry).
 5. Show a **loading UI** to the user while the subscription is being activated after Stripe redirect.
+6. **Handle payment failures** gracefully — Stripe retries automatically; APIM subscription remains `ON_HOLD` until payment clears.
+7. **Enforce gateway access** — block/unblock API access in response to Stripe `invoice.payment_failed` and `customer.subscription.updated` events.
+8. Provide a **Manage Billing** button in the DevPortal that opens the Stripe Customer Portal for invoice history and card management.
 
 ### 2.2 Solution Architecture
 
@@ -320,7 +324,6 @@ sequenceDiagram
     participant CS  as Webhook WAR<br/>/api/am/stripe/complete-session
     participant CA  as Stripe<br/>Connected Account
 
-    %% ════════════════════════════════════════════════════════
     rect rgb(230, 245, 255)
         Note over User,PA: Phase 1 — Subscribe & Redirect
         User  ->>  DP  : Click "Subscribe to API"
@@ -339,14 +342,12 @@ sequenceDiagram
         DP    ->>  SC  : window.location.href = redirectUrl<br/>(browser redirected to Stripe)
     end
 
-    %% ════════════════════════════════════════════════════════
     rect rgb(255, 245, 220)
         Note over User,SC: Phase 2 — Card Entry on Stripe (APIM not involved)
         User  ->>  SC  : Enter card details & click Pay
         SC    -->> User: Show confirmation screen
     end
 
-    %% ════════════════════════════════════════════════════════
     rect rgb(230, 255, 235)
         Note over SC,CA: Phase 3 — Parallel Completion (first-one-wins)
 
@@ -395,25 +396,31 @@ sequenceDiagram
 
 #### A. `StripeSubscriptionCreationWorkflowExecutor` (Plugin JAR)
 
-Three new decision points were added to `monetizeSubscription()`:
+Three decision points in `monetizeSubscription()`:
 
 **Decision 1 — New Subscriber (no platform customer)**
 Instead of creating a platform customer with `tok_visa`, the executor now:
-1. Looks up the **application UUID** from `AM_APPLICATION` using `getApplicationUUID(applicationId)` (DevPortal routes use UUID, not integer ID).
-2. Creates a **Stripe Checkout Session** in `SETUP` mode on the platform account, with the success URL set to `{checkoutSuccessUrl}/{appUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}`.
-3. Stores the session ID and workflow reference in `AM_STRIPE_CHECKOUT_SESSIONS` with `STATUS=PENDING`.
-4. Sets the workflow status to `CREATED` (pending — do not approve yet).
-5. Returns an `HttpWorkflowResponse` with the Checkout Session URL as the redirect URL.
-6. APIM serialises this into `redirectionParams` in the subscription API response.
+1. Looks up the **application UUID** from `AM_APPLICATION` using `getApplicationUUID(applicationId)`.
+2. Creates a **Stripe Checkout Session** in `SETUP` mode on the platform account.
+3. Stores the session in `AM_STRIPE_CHECKOUT_SESSIONS` with `STATUS=PENDING`.
+4. Sets workflow status to `CREATED` (pending).
+5. Returns `HttpWorkflowResponse` with the Checkout Session URL.
 
 **Decision 2 — Platform Customer exists, new Application (no shared customer)**
-When the subscriber already has a platform customer (from a previous subscription) but subscribes with a new application:
-- The executor checks if the platform customer has a `default_payment_method` set.
-- If **yes** (created via Checkout): clones the payment method to the connected account and creates a shared customer with that payment method as default. No new Checkout redirect needed.
-- If **no** (created via legacy `tok_visa` path): falls back to the old `Token.create` approach.
+- Checks if the platform customer has a `default_payment_method` (set by Checkout).
+- If **yes**: clones the PM to the connected account and creates a shared customer. No new Checkout needed.
+- If **no** (legacy `tok_visa` path): falls back to the old `Token.create` approach.
 
 **Decision 3 — Both customers exist**
-Proceeds directly to creating the Stripe Subscription (unchanged from default).
+Proceeds directly to creating the Stripe Subscription (same as default).
+
+**Payment declined handling in `monetizeSubscription()`**
+
+If `createMonetizedSubscriptions()` throws `STRIPE_PAYMENT_DECLINED` (initial invoice `incomplete`):
+1. Cancel the orphaned incomplete Stripe subscription (so it does not show in the Customer Portal).
+2. **Retry once** with the platform customer's current default PM on a fresh shared customer (handles stale shared customer entries from prior failed attempts).
+3. If the retry succeeds: return `execute(workflowDTO)` — subscription activates, no Checkout needed.
+4. If the retry also fails: cancel the retry orphan, fall back to a new Stripe Checkout Session.
 
 **Idempotency guard in `complete()`**
 
@@ -426,50 +433,44 @@ WHERE SESSION_ID = ? AND STATUS = 'PENDING'
 
 - `rowsAffected == 1` → this path wins; proceed with Stripe work.
 - `rowsAffected == 0` → another path already claimed it; skip Stripe work, proceed to APIM workflow DB update only.
-- If Stripe work throws, the claim is reset (`IN_PROGRESS → PENDING`) so the other path can retry.
+- If Stripe work throws a **non-payment** error, the claim is reset (`IN_PROGRESS → PENDING`) so the other path can retry.
+- If Stripe work throws `STRIPE_PAYMENT_DECLINED`, the session is marked `COMPLETED` (not reset) — Fix 3 handles activation when Stripe retries and collects payment.
 
 #### B. DevPortal UI Override (`override/src/app/components/`)
 
-Two components were updated in the DevPortal override directory (takes precedence over source at runtime):
+**Stripe redirect on `ON_HOLD`** (`SubscriptionTableData.jsx`):
+When a subscription row shows `ON_HOLD`, the "Resume" button calls `GET /checkout-url` then:
+1. Tries `/complete-session` first (handles already-paid but stuck cases).
+2. On HTTP 200 → refresh.
+3. On HTTP 402 → show alert: "Your initial payment was declined. Stripe will retry automatically. You can also delete this subscription and re-subscribe with a different card."
+4. On other error or no session → redirect to `checkoutUrl`.
 
-- `Applications/Details/Subscriptions.jsx` — the subscriptions panel inside the Application detail view.
-- `Apis/Details/Credentials/Credentials.jsx` — the credentials/subscription panel inside the API detail view.
-
-**Stripe redirect on `ON_HOLD`** (both files):
-When the subscription API responds with `status: ON_HOLD`, the UI reads `redirectionParams`, parses it as JSON to extract `redirectUrl`, and immediately redirects the browser to the Stripe Checkout page.
-
-**Browser-redirect completion** (`Subscriptions.jsx` only):
+**Browser-redirect completion** (`Subscriptions.jsx`):
 After Stripe, the user lands on `.../applications/{appUUID}/subscriptions?session_id=cs_xxx`. On `componentDidMount`:
-1. Detects `session_id` query parameter in `window.location.search`.
-2. Sets state `stripeSessionCompleting: true`.
-3. Shows a **loading UI**:
-   - **Full-page spinner** if subscriptions haven't loaded yet ("Activating your subscription…").
-   - **Inline info banner** with spinner if subscriptions are already visible ("Confirming your payment…").
-4. Calls `POST /api/am/stripe/complete-session?session_id=cs_xxx`.
-5. On success: clears `session_id` from URL (`window.history.replaceState`), refreshes the subscription list, shows **"Payment confirmed! Your subscription is now active."** alert.
-6. On error: shows an error alert with support contact message.
+1. Detects `session_id` query parameter.
+2. Sets state `stripeSessionCompleting: true` → shows loading UI.
+3. Calls `POST /api/am/stripe/complete-session?session_id=cs_xxx`.
+4. On success: clears `session_id` from URL, refreshes subscription list, shows "Payment confirmed!" alert.
+5. On HTTP 402 (payment declined): shows payment-declined alert with retry guidance.
+
+**Manage Billing button** (`SubscriptionTableData.jsx`):
+When a subscription is `UNBLOCKED` on a monetized API, a "Manage Billing" button appears. Clicking it calls `GET /api/am/stripe/billing-portal?applicationId={appUUID}` and opens the returned Stripe Customer Portal URL in a new tab.
 
 #### C. Stripe Webhook WAR (`api#am#stripe.war`)
 
-A standalone Java web application (WAR) deployed at `/api/am/stripe/` on the Carbon server. It exposes three endpoints:
+A standalone Java web application deployed at `/api/am/stripe/` on the Carbon server. It exposes five endpoints:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/am/stripe/webhook` | `POST` | Receives `checkout.session.completed` events from Stripe (HMAC-SHA256 verified) |
-| `/api/am/stripe/checkout-url` | `GET` | Returns Stripe Checkout URL for a pending session by workflow reference |
-| `/api/am/stripe/complete-session` | `POST` | Browser-redirect completion — called by DevPortal UI with `?session_id=cs_xxx` |
+| `/api/am/stripe/webhook` | `POST` | Receives Stripe events (HMAC-SHA256 verified) |
+| `/api/am/stripe/checkout-url` | `GET` | Returns checkout URL + session ID for an ON_HOLD subscription |
+| `/api/am/stripe/complete-session` | `POST` | Browser-redirect completion — called by DevPortal UI |
+| `/api/am/stripe/billing-portal` | `GET` | Opens Stripe Customer Portal for a given application UUID |
 
-**`/api/am/stripe/complete-session`** (`CompleteSessionApiServiceImpl`):
-1. Validates `session_id` format (must start with `cs_`).
-2. Queries `AM_STRIPE_CHECKOUT_SESSIONS` for the workflow reference and current status.
-3. If `STATUS=COMPLETED` → returns `{"status":"already_completed"}` (webhook already won).
-4. Otherwise loads the pending `WorkflowDTO`, sets `checkoutSessionId` attribute and `APPROVED` status, then calls `WorkflowExecutorFactory.complete()`.
-5. The executor's idempotency guard handles the race with the webhook.
-
-Key design decisions for the WAR:
-- **No stripe-java dependency** — stripe-java 24.x requires Gson 2.10+ (`GsonBuilder.addReflectionAccessFilter`), but the Carbon OSGi classloader exposes an older Gson version that shadows the WAR's bundled copy, causing `NoSuchMethodError` at startup. Stripe signature verification is implemented natively using Java's `javax.crypto.Mac` (HMAC-SHA256).
-- **Jackson for JSON parsing** — the event payload is parsed with Jackson's `ObjectMapper`, eliminating the Gson dependency entirely.
-- **Delegates workflow completion to the plugin** — the WAR extracts context and calls `WorkflowExecutorFactory.getWorkflowExecutor().complete()`. The actual Stripe customer/subscription creation runs inside the plugin OSGi bundle.
+Key design decisions:
+- **No stripe-java dependency** — HMAC-SHA256 verification is implemented natively with `javax.crypto.Mac` to avoid Gson classloader conflicts with the Carbon OSGi runtime.
+- **Jackson for JSON parsing** — eliminates the Gson dependency entirely.
+- **Delegates workflow completion to the plugin** — the WAR calls `WorkflowExecutorFactory.getWorkflowExecutor().complete()`. Stripe customer/subscription creation runs inside the plugin OSGi bundle.
 
 ### 2.4 Full End-to-End Flow (Phase 3 detail)
 
@@ -519,7 +520,7 @@ sequenceDiagram
     PLG->>DB: Update subscription → UNBLOCKED
 
     CS-->>DP: {"status":"completed"}
-    DP->>DP: stripeSessionCompleting=false<br/>Clear ?session_id from URL<br/>Refresh subscription list<br/>Alert: "Payment confirmed!"
+    DP->>DP: stripeSessionCompleting=false<br/>Clear ?session_id from URL<br/>Refresh subscriptions list<br/>Alert: "Payment confirmed!"
 ```
 
 ### 2.5 Second Application Subscription Flow (Returning Subscriber)
@@ -532,6 +533,7 @@ sequenceDiagram
     participant DP as WSO2 DevPortal
     participant API as APIM Store API
     participant WF as StripeSubscriptionWorkflowExecutor
+    participant DB as APIM Database
     participant PA as Stripe Platform Account
     participant CA as Stripe Connected Account
 
@@ -539,7 +541,10 @@ sequenceDiagram
     DP->>API: POST /subscriptions
     API->>WF: monetizeSubscription()
 
-    Note over WF: Platform customer EXISTS<br/>Shared customer does NOT exist
+    Note over WF: Platform customer EXISTS<br/>Shared customer does NOT exist (new app)
+
+    WF->>DB: getSharedCustomer(appId, provider, tenant)<br/>ORDER BY ID DESC LIMIT 1
+    DB-->>WF: no shared customer found
 
     WF->>PA: Customer.retrieve(platform_customer_id)
     PA-->>WF: customer.invoice_settings.default_payment_method = pm_xxx
@@ -554,7 +559,236 @@ sequenceDiagram
     DP-->>U: Subscription Active (no redirect needed)
 ```
 
-### 2.6 Stripe Webhook WAR — Signature Verification Detail
+**If the initial charge fails (e.g. stale shared customer from a prior failed attempt):**
+
+```mermaid
+sequenceDiagram
+    participant WF as StripeSubscriptionWorkflowExecutor
+    participant DB as APIM Database
+    participant PA as Stripe Platform Account
+    participant CA as Stripe Connected Account
+
+    Note over WF: Stale shared customer found → Subscription.create → incomplete
+
+    WF->>CA: Subscription.create(stale_shared_customer, plan_id)
+    CA-->>WF: subscription {status: incomplete}
+    Note over WF: throws STRIPE_PAYMENT_DECLINED:sub_xxx
+
+    WF->>CA: Subscription.cancel(orphaned_sub_id)
+    Note over WF: Retry once with platform PM
+
+    WF->>PA: Customer.retrieve → default_payment_method = pm_xxx
+    WF->>CA: PaymentMethod.create(clone) → Customer.create(fresh shared)
+    WF->>CA: Subscription.create(fresh_shared_customer, plan_id)
+    CA-->>WF: subscription {status: active}
+    WF-->>WF: retrySucceeded=true → execute(workflowDTO)
+    Note over WF: Subscription UNBLOCKED — no Checkout redirect needed
+```
+
+### 2.6 Payment Failure Handling (STRIPE_PAYMENT_DECLINED flow)
+
+When a card is accepted by Stripe but the initial subscription invoice payment fails, Stripe sets the subscription status to `incomplete`. The custom implementation handles this through two sub-paths.
+
+#### 2.6.1 Payment Failed via Checkout Path (`completeStripeCheckoutSubscription`)
+
+```mermaid
+sequenceDiagram
+    participant PLG as StripeSubscriptionWorkflowExecutor
+    participant DB  as APIM Database
+    participant CS  as /complete-session endpoint
+    participant DP  as DevPortal UI
+    participant CA  as Stripe Connected Account
+
+    Note over PLG: complete() called after checkout
+
+    PLG->>CA: Subscription.create(shared_customer, plan_id)
+    CA-->>PLG: subscription {status: incomplete}
+    Note over PLG: createMonetizedSubscriptions throws<br/>WorkflowException("STRIPE_PAYMENT_DECLINED:sub_xxx:...")
+
+    Note over PLG: completeStripeCheckoutSubscription catches marker
+    PLG->>DB: Save sub_xxx to AM_MONETIZATION_SUBSCRIPTIONS<br/>(so Fix 3 can find it when Stripe retries)
+    PLG->>DB: Mark session STATUS=COMPLETED<br/>(not reset — Fix 3 handles activation)
+
+    PLG-->>CS: re-throws WorkflowException
+    CS->>CS: Detects STRIPE_PAYMENT_DECLINED prefix
+    CS-->>DP: HTTP 402 {error: payment_declined,<br/>message: "Stripe will retry automatically..."}
+    DP->>DP: Show payment-declined alert
+    Note over DP: Subscription stays ON_HOLD<br/>No redirect to checkoutUrl
+```
+
+#### 2.6.2 Payment Failed via Direct Path (`monetizeSubscription`)
+
+```mermaid
+sequenceDiagram
+    participant WF  as StripeSubscriptionWorkflowExecutor
+    participant DB  as APIM Database
+    participant API as APIM Store API
+    participant DP  as DevPortal UI
+    participant PA  as Stripe Platform Account
+    participant CA  as Stripe Connected Account
+
+    WF->>CA: Subscription.create(shared_customer, plan_id)
+    CA-->>WF: subscription {status: incomplete}
+    Note over WF: throws STRIPE_PAYMENT_DECLINED:sub_xxx
+
+    WF->>CA: Subscription.cancel(sub_xxx)<br/>(orphan cleanup)
+
+    Note over WF: Retry with platform customer's current PM
+
+    WF->>DB: getPlatformCustomer(subscriberId, tenantId)
+    DB-->>WF: platCust {customerId}
+    WF->>PA: getDefaultPaymentMethodId(customerId)
+    PA-->>WF: retryPmId
+
+    WF->>CA: createSharedCustomerWithPaymentMethod(retryPmId)
+    WF->>CA: Subscription.create(fresh_shared, plan_id)
+
+    alt Retry succeeds
+        CA-->>WF: subscription {status: active}
+        WF-->>API: WorkflowStatus.APPROVED
+        API-->>DP: {"status": "UNBLOCKED"}
+    else Retry also fails
+        CA-->>WF: subscription {status: incomplete}
+        WF->>CA: Subscription.cancel(retry_orphan)
+        WF->>PA: createCheckoutSession()
+        PA-->>WF: {sessionId, checkoutUrl}
+        WF->>DB: Save session (STATUS=PENDING)
+        WF-->>API: HttpWorkflowResponse {redirectUrl}
+        API-->>DP: {status: ON_HOLD, redirectionParams}
+        DP->>DP: Show "Resume" button
+    end
+```
+
+### 2.7 Gateway Enforcement — Invoice Payment Failed + Recovery (Fix 2 + Fix 3)
+
+After a subscription is activated, Stripe sends periodic invoices for recurring charges. If a recurring payment fails, the custom webhook handler blocks API access. When Stripe automatically retries and collects payment, API access is unblocked.
+
+#### Registered Stripe Webhook Events
+
+| Event | Handler | Action |
+|---|---|---|
+| `checkout.session.completed` | `WebhookApiServiceImpl` | Activate new subscription (Fix 1) |
+| `invoice.payment_failed` | `WebhookApiServiceImpl` | Block API access (Fix 2) |
+| `customer.subscription.updated` | `WebhookApiServiceImpl` | Unblock API access when subscription becomes active (Fix 3) |
+
+```mermaid
+sequenceDiagram
+    participant STR as Stripe
+    participant WH  as /webhook endpoint
+    participant PLG as Stripe Plugin
+    participant DB  as APIM Database
+    participant GW  as API Gateway
+
+    Note over STR,GW: Recurring invoice — payment fails
+
+    STR->>WH: POST /webhook<br/>event: invoice.payment_failed
+    WH->>WH: Verify HMAC-SHA256
+    WH->>WH: Extract subscriptionId from invoice object
+    WH->>DB: SELECT s.UUID, ms.TENANT_ID<br/>FROM AM_SUBSCRIPTION s<br/>JOIN AM_MONETIZATION_SUBSCRIPTIONS ms<br/>WHERE ms.SUBSCRIPTION_ID = ?
+    DB-->>WH: {apimSubscriptionUuid, tenantId}
+    WH->>PLG: updateSubscriptionStatus(uuid, BLOCKED)
+    PLG->>DB: UPDATE AM_SUBSCRIPTION SET STATUS=BLOCKED
+    PLG->>GW: Remove API access key
+    WH-->>STR: HTTP 200
+
+    Note over STR,GW: Stripe retries — payment succeeds
+
+    STR->>WH: POST /webhook<br/>event: customer.subscription.updated
+    WH->>WH: Verify HMAC-SHA256
+    WH->>WH: Check subscription.status == "active"
+    WH->>DB: SELECT s.UUID, ms.TENANT_ID<br/>WHERE ms.SUBSCRIPTION_ID = ?
+    DB-->>WH: {apimSubscriptionUuid, tenantId}
+    WH->>PLG: updateSubscriptionStatus(uuid, UNBLOCKED)
+    PLG->>DB: UPDATE AM_SUBSCRIPTION SET STATUS=UNBLOCKED
+    PLG->>GW: Restore API access key
+    WH-->>STR: HTTP 200
+```
+
+**Key SQL used for both Fix 2 and Fix 3:**
+
+```sql
+SELECT s.UUID, ms.TENANT_ID
+FROM AM_SUBSCRIPTION s
+JOIN AM_MONETIZATION_SUBSCRIPTIONS ms
+  ON ms.SUBSCRIBED_API_ID = s.API_ID
+  AND ms.SUBSCRIBED_APPLICATION_ID = s.APPLICATION_ID
+WHERE ms.SUBSCRIPTION_ID = ?
+```
+
+This resolves a Stripe subscription ID to the APIM subscription UUID and tenant ID needed to block or unblock access.
+
+### 2.8 Billing Portal (Manage Billing)
+
+The DevPortal shows a **"Manage Billing"** button on each active monetized subscription row. Clicking it opens the Stripe Customer Portal in a new tab, allowing the subscriber to view invoice history, download invoices, and update their payment method.
+
+```mermaid
+sequenceDiagram
+    actor User as Subscriber
+    participant DP  as DevPortal UI<br/>SubscriptionTableData.jsx
+    participant BP  as /billing-portal endpoint
+    participant DB  as APIM Database
+    participant PA  as Stripe Platform Account
+    participant CA  as Stripe Connected Account
+
+    User->>DP: Click "Manage Billing"
+    DP->>BP: GET /api/am/stripe/billing-portal?applicationId={appUUID}
+    BP->>DB: SELECT sc.SHARED_CUSTOMER_ID, sc.TENANT_ID, api.API_UUID<br/>FROM AM_MONETIZATION_SHARED_CUSTOMERS sc<br/>JOIN AM_APPLICATION app ON app.UUID=?<br/>JOIN AM_MONETIZATION_SUBSCRIPTIONS ms ...<br/>ORDER BY sc.ID DESC LIMIT 1
+    DB-->>BP: {stripeCustomerId, tenantId, apiUuid}
+    BP->>BP: Resolve connected account key from API monetization properties
+    BP->>CA: BillingPortal.Session.create(<br/>  customer=stripeCustomerId,<br/>  return_url=devportal_applications_url<br/>)
+    CA-->>BP: {portalUrl}
+    BP-->>DP: HTTP 200 {url: "https://billing.stripe.com/..."}
+    DP->>User: window.open(url, '_blank')
+```
+
+**Important detail:** The billing portal is opened for the **shared customer** on the **connected account** (not the platform customer), because subscriptions and invoices live on the connected account. `ORDER BY sc.ID DESC LIMIT 1` ensures the latest valid shared customer is used when multiple entries exist (e.g. from prior failed attempts).
+
+### 2.9 Subscription Deletion Behavior
+
+When a subscriber deletes an `ON_HOLD` or `UNBLOCKED` subscription from the DevPortal:
+
+```mermaid
+flowchart TD
+    A[User clicks Delete Subscription] --> B[deleteMonetizedSubscription called]
+    B --> C{AM_MONETIZATION_SUBSCRIPTIONS\nhas Stripe sub ID?}
+
+    C -- Yes --> D[Subscription.cancel\ninvoice_now=true]
+    D --> E{Stripe status\n== canceled?}
+    E -- Yes --> F[DELETE from\nAM_MONETIZATION_SUBSCRIPTIONS]
+    E -- No --> Z1[WorkflowException\nStripe cancel failed]
+
+    C -- No --> G[No Stripe sub ID\northan already cancelled\nin monetizeSubscription catch]
+
+    F --> H[complete: apiMgtDAO.removeSubscription\nRemove from AM_SUBSCRIPTION]
+    G --> H
+
+    H --> I[Subscription deleted from APIM]
+```
+
+**What is cleaned up:**
+
+| Table | Cleaned on delete? | Notes |
+|---|---|---|
+| `AM_SUBSCRIPTION` | Yes | Via `apiMgtDAO.removeSubscription()` in `complete()` |
+| `AM_MONETIZATION_SUBSCRIPTIONS` | Yes (if row existed) | Via `removeMonetizedSubscription()` |
+| `AM_STRIPE_CHECKOUT_SESSIONS` | **No** | PENDING row remains — benign; the workflow is gone so `/complete-session` returns `already_completed` |
+| `AM_MONETIZATION_SHARED_CUSTOMERS` | **No** | Intentional — reused for future subscriptions from the same app |
+| `AM_MONETIZATION_PLATFORM_CUSTOMERS` | **No** | Intentional — one global entry per subscriber |
+
+**Case A — Subscription ID in DB** (payment failed during checkout path — we save it for Fix 3): Stripe cancellation is called with `invoice_now=true`. The `incomplete` subscription is cancelled in Stripe, voiding the pending invoice.
+
+**Case B — No subscription ID in DB** (payment failed during direct path — orphan was cancelled inline in `monetizeSubscription`): Deletion skips the Stripe API call. The orphaned Stripe subscription was already cancelled when `monetizeSubscription` caught the `STRIPE_PAYMENT_DECLINED` exception.
+
+### 2.10 Platform Customer Idempotency
+
+`createPlatformCustomerWithPaymentMethod()` is idempotent against race conditions and retries:
+
+1. **DB lookup first**: checks `AM_MONETIZATION_PLATFORM_CUSTOMERS` before creating anything in Stripe.
+2. **Stripe-level recovery**: if Stripe throws `InvalidRequestException: payment method already been attached to a customer`, the code calls `PaymentMethod.retrieve(paymentMethodId)` to find the existing customer, then saves it to the DB and returns it.
+
+This prevents duplicate platform customers when the same subscriber subscribes twice simultaneously or when a previous attempt failed after the Stripe call but before the DB write.
+
+### 2.11 Stripe Webhook WAR — Signature Verification Detail
 
 Stripe signs every webhook delivery with HMAC-SHA256. The verification logic (implemented natively, no stripe-java) works as follows:
 
@@ -573,21 +807,27 @@ flowchart TD
     G -- Yes --> H[Parse event JSON<br/>with Jackson]
     H --> I{event.type?}
     I -- checkout.session.completed --> J[Extract workflowReference<br/>from session metadata]
-    I -- other --> K[Ignore — return 200]
-    J --> L[Load WorkflowDTO from DB]
-    L --> M[Set checkoutSessionId attribute]
-    M --> N[WorkflowExecutor.complete()]
-    N --> O[200 OK — Stripe stops retrying]
+    I -- invoice.payment_failed --> K[Extract subscriptionId<br/>from invoice object]
+    I -- customer.subscription.updated --> L[Check status == active<br/>Extract subscriptionId]
+    I -- other --> M[Ignore — return 200]
+    J --> N[Load WorkflowDTO from DB]
+    N --> O[Set checkoutSessionId attribute]
+    O --> P[WorkflowExecutor.complete]
+    P --> Q[200 OK]
+    K --> R[Block APIM subscription]
+    R --> Q
+    L --> S[Unblock APIM subscription]
+    S --> Q
 ```
 
-### 2.7 Database Tables Used
+### 2.12 Database Tables Used
 
 | Table | Purpose |
 |---|---|
 | `AM_WORKFLOWS` | Stores workflow state (CREATED → APPROVED). Primary key for resumption. |
-| `AM_STRIPE_PLATFORM_CUSTOMER` | Maps APIM subscriber ID to Stripe platform customer ID |
-| `AM_STRIPE_SHARED_CUSTOMER` | Maps application + API provider to Stripe connected-account customer ID |
-| `AM_STRIPE_SUBSCRIPTION` | Maps APIM subscription to Stripe subscription ID |
+| `AM_MONETIZATION_PLATFORM_CUSTOMERS` | Maps APIM subscriber ID to Stripe platform customer ID |
+| `AM_MONETIZATION_SHARED_CUSTOMERS` | Maps (application, API provider, tenant) to Stripe connected-account customer ID |
+| `AM_MONETIZATION_SUBSCRIPTIONS` | Maps APIM subscription to Stripe subscription ID |
 | `AM_STRIPE_CHECKOUT_SESSIONS` | Stores active checkout sessions: session ID, workflow reference, subscriber, status |
 
 #### `AM_STRIPE_CHECKOUT_SESSIONS` — Status Values
@@ -596,10 +836,34 @@ flowchart TD
 |---|---|
 | `PENDING` | Session created, waiting for subscriber to complete card entry on Stripe |
 | `IN_PROGRESS` | Atomically claimed by one completion path (webhook or browser-redirect) — Stripe work is running |
-| `COMPLETED` | Subscription successfully activated |
+| `COMPLETED` | Subscription successfully activated (or payment declined — Fix 3 handles subsequent activation) |
 | `EXPIRED` | Session expired before the subscriber entered a card |
 
-### 2.8 Configuration
+#### Key SQL Patterns
+
+**Get latest shared customer** (used in `monetizeSubscription` and `getSharedCustomer`):
+```sql
+SELECT ID, SHARED_CUSTOMER_ID
+FROM AM_MONETIZATION_SHARED_CUSTOMERS
+WHERE APPLICATION_ID=? AND API_PROVIDER=? AND TENANT_ID=?
+ORDER BY ID DESC LIMIT 1
+```
+`ORDER BY ID DESC LIMIT 1` ensures the most recently created shared customer is returned, preventing stale entries from prior failed attempts from being picked up.
+
+**Get shared customer for billing portal** (used in `BillingPortalApiServiceImpl`):
+```sql
+SELECT sc.SHARED_CUSTOMER_ID AS STRIPE_CUSTOMER_ID, sc.TENANT_ID, api.API_UUID
+FROM AM_MONETIZATION_SHARED_CUSTOMERS sc
+JOIN AM_APPLICATION app ON app.APPLICATION_ID = sc.APPLICATION_ID
+JOIN AM_MONETIZATION_SUBSCRIPTIONS ms
+  ON ms.SUBSCRIBED_APPLICATION_ID = sc.APPLICATION_ID
+  AND ms.SHARED_CUSTOMER_ID = sc.ID
+JOIN AM_API api ON api.API_ID = ms.SUBSCRIBED_API_ID
+WHERE app.UUID = ?
+ORDER BY sc.ID DESC LIMIT 1
+```
+
+### 2.13 Configuration
 
 **`workflow-extensions.xml`** — set `checkoutSuccessUrl` to the **base applications URL** (the plugin appends `/{applicationUUID}/subscriptions` automatically):
 
@@ -615,7 +879,7 @@ At runtime, Stripe is configured with a success URL of:
 https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscriptions?session_id={CHECKOUT_SESSION_ID}
 ```
 
-> **Important:** Do NOT add `/subscriptions` to `checkoutSuccessUrl` — the plugin appends it dynamically using the application UUID looked up from `AM_APPLICATION`. Using the integer application ID (e.g. `/applications/57/subscriptions`) causes a "Page Not Found" error because DevPortal routes use UUIDs.
+> **Important:** Do NOT add `/subscriptions` to `checkoutSuccessUrl` — the plugin appends it dynamically using the application UUID. Using the integer application ID causes a "Page Not Found" error because DevPortal routes use UUIDs.
 
 **`api-manager.xml`** — webhook signing secret:
 ```xml
@@ -626,7 +890,10 @@ https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscript
 
 **Stripe Dashboard** — webhook endpoint registration:
 - Endpoint URL: `https://<apim-host>:9443/api/am/stripe/webhook`
-- Event: `checkout.session.completed`
+- Events to register:
+  - `checkout.session.completed`
+  - `invoice.payment_failed`
+  - `customer.subscription.updated`
 
 ---
 
@@ -636,12 +903,18 @@ https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscript
 |---|---|---|---|
 | 1 | `Missing required param: currency` | stripe-java 24.x requires `currency` on Checkout Session for setup mode | Retrieve the Stripe Plan for the tier before creating the session; pass the plan's currency to `SessionCreateParams.setCurrency()` |
 | 2 | `redirectionParams: null` in subscription response | `StripeSubscriptionCreationWorkflowExecutor` returned `GeneralWorkflowResponse` — APIM only populates `redirectionParams` when the response is `instanceof HttpWorkflowResponse` | Changed return type to `HttpWorkflowResponse` with `setRedirectUrl(checkoutSession.getUrl())` |
-| 3 | UI redirect not working (`/checkout-url` returned 404) | DevPortal override files called `GET /api/am/stripe/checkout-url?subscriptionId={UUID}` but the DB stores a numeric workflow reference (`9`), not a UUID — query returned 0 rows | Removed the `/checkout-url` call; read `redirectionParams` directly from the subscription POST response |
+| 3 | UI redirect not working (`/checkout-url` returned 404) | DevPortal override files called `GET /api/am/stripe/checkout-url?subscriptionId={UUID}` but the DB stores a numeric workflow reference, not a UUID — query returned 0 rows | Removed the `/checkout-url` call; read `redirectionParams` directly from the subscription POST response |
 | 4 | Webhook `NoSuchMethodError: GsonBuilder.addReflectionAccessFilter` | `stripe-java 24.x` calls Gson 2.10+ API, but the Carbon OSGi classloader exposes an older Gson that shadows the WAR's bundled copy | Removed stripe-java from the webhook WAR entirely; implemented HMAC-SHA256 verification natively with `javax.crypto.Mac` and parsed event JSON with Jackson |
-| 5 | `No attached payment method` on Subscription.create | `createSharedCustomerWithPaymentMethod` attached the payment method to the customer but did not set `invoice_settings.default_payment_method` — Stripe requires this for subscription billing | Added `invoice_settings.default_payment_method = clonedPm.getId()` to the shared customer creation params |
-| 6 | Second-application subscription fails — `Token.create: customer must have an active payment source` | The legacy `createSharedCustomer` uses `Token.create` which requires a Stripe **source** (legacy card) on the platform customer. Checkout-created customers have a `payment_method` instead — incompatible with the Token API | Added `getDefaultPaymentMethodId()` helper: if the platform customer has a default payment method (Checkout path), use `createSharedCustomerWithPaymentMethod`; otherwise fall back to the legacy `createSharedCustomer` |
-| 7 | No loading UI or success alert after Stripe redirect | `checkoutSuccessUrl` pointed to `/devportal/applications` (the Applications list page) — `Subscriptions.jsx` never mounted so `session_id` was never detected | Added browser-redirect completion path to `Subscriptions.jsx` (`componentDidMount` detects `?session_id=`) and `POST /api/am/stripe/complete-session` endpoint |
-| 8 | "Page Not Found" after Stripe redirect | Success URL used `subWorkFlowDTO.getApplicationId()` (integer `57`) but DevPortal routes use the application UUID — route `/applications/57/subscriptions` does not exist | Added `getApplicationUUID(int applicationId)` which queries `AM_APPLICATION.UUID`; success URL now uses the UUID |
+| 5 | `No attached payment method` on Subscription.create | `createSharedCustomerWithPaymentMethod` attached the PM but did not set `invoice_settings.default_payment_method` — Stripe requires this for subscription billing | Added `invoice_settings.default_payment_method = clonedPm.getId()` to the shared customer creation params |
+| 6 | Second-application subscription fails — `Token.create: customer must have an active payment source` | The legacy `createSharedCustomer` uses `Token.create` which requires a Stripe source. Checkout-created customers have a `payment_method` — incompatible with the Token API | Added `getDefaultPaymentMethodId()` helper: if platform customer has a default PM, use `createSharedCustomerWithPaymentMethod`; otherwise fall back to legacy `createSharedCustomer` |
+| 7 | No loading UI or success alert after Stripe redirect | `checkoutSuccessUrl` pointed to `/devportal/applications` — `Subscriptions.jsx` never mounted so `session_id` was never detected | Added browser-redirect completion path to `Subscriptions.jsx` (`componentDidMount` detects `?session_id=`) and `POST /api/am/stripe/complete-session` endpoint |
+| 8 | "Page Not Found" after Stripe redirect | Success URL used `subWorkFlowDTO.getApplicationId()` (integer `57`) but DevPortal routes use the application UUID | Added `getApplicationUUID(int applicationId)` which queries `AM_APPLICATION.UUID`; success URL now uses the UUID |
+| 9 | Incomplete subscription shown as "You're all done here" | `createMonetizedSubscriptions` returned normally for `incomplete` subscriptions; `completeStripeCheckoutSubscription` marked session `COMPLETED` and the browser-redirect path fell back to the already-consumed Stripe Checkout URL | Changed `createMonetizedSubscriptions` to throw `WorkflowException("STRIPE_PAYMENT_DECLINED:sub_xxx:...")` for incomplete subscriptions; `CompleteSessionApiServiceImpl` returns HTTP 402; DevPortal shows a payment-declined alert instead of redirecting |
+| 10 | `InvalidRequestException: payment method already been attached` on re-subscribe | `createPlatformCustomerWithPaymentMethod` called unconditionally without checking if a platform customer already existed in DB | Made idempotent: check DB first via `getPlatformCustomer()`; on "already attached" error recover via `PaymentMethod.retrieve()` to find the existing customer |
+| 11 | `STRIPE_PAYMENT_DECLINED` on re-subscribe (different app, card already on file) | `getSharedCustomer` returned a stale shared customer from a prior failed attempt (SQL had no `ORDER BY` / `LIMIT`); subscription immediately went `incomplete` | Added `ORDER BY ID DESC LIMIT 1` to `GET_BE_SHARED_CUSTOMER_SQL`; added retry logic in `monetizeSubscription` catch block — tries fresh shared customer with platform PM before falling back to Checkout |
+| 12 | Billing portal showing old card and outstanding invoice | `GET_SHARED_CUSTOMER_AND_API_BY_APP_UUID_SQL` had no `ORDER BY` — returned the oldest shared customer (which had the failed card); orphaned incomplete subscription still existed in Stripe | Added `ORDER BY sc.ID DESC` to billing portal SQL; cancel orphaned incomplete subscription in `monetizeSubscription` catch block before Checkout fallback |
+| 13 | Recurring payment failure does not block API access | Default implementation had no webhook handlers for `invoice.payment_failed` — subscribers retained full API access even after payment failure | Added Fix 2: `invoice.payment_failed` handler calls `updateSubscriptionStatus(BLOCKED)` using Stripe subscription ID to locate APIM subscription |
+| 14 | Subscription not re-activated after Stripe payment retry succeeds | No handler for `customer.subscription.updated` — when Stripe auto-retried and collected payment, APIM subscription remained `BLOCKED` | Added Fix 3: `customer.subscription.updated` handler checks `subscription.status == active` and calls `updateSubscriptionStatus(UNBLOCKED)` |
 
 ---
 
@@ -651,20 +924,21 @@ https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscript
 [ ] Build the plugin JAR:
       cd stripe-plugin && mvn clean package
       Copy target/org.wso2.apim.monetization.impl-*.jar
-          → <APIM_HOME>/repository/components/dropins/
           → <APIM_HOME>/repository/components/lib/
+      NOTE: dropins/ is NOT needed — lib/ is sufficient and avoids classloader issues
 
 [ ] Build the webhook WAR:
       cd stripe-webhook && mvn clean package
+      Delete the extracted dir first (if server was running):
+          rm -rf <APIM_HOME>/repository/deployment/server/webapps/api#am#stripe/
       Copy target/api#am#stripe.war
           → <APIM_HOME>/repository/deployment/server/webapps/
 
 [ ] DevPortal UI overrides — place in override/src/ (no rebuild required at runtime):
       <APIM_HOME>/repository/deployment/server/webapps/devportal/
         override/src/app/components/Applications/Details/Subscriptions.jsx
+        override/src/app/components/Applications/Details/SubscriptionTableData.jsx
         override/src/app/components/Apis/Details/Credentials/Credentials.jsx
-      If running build:dev / npm start — ensure override/ files are present;
-      the webpack resolver picks override/ over source/ automatically.
 
 [ ] Configure workflow-extensions.xml:
       checkoutSuccessUrl = https://<devportal-host>:9443/devportal/applications
@@ -676,7 +950,21 @@ https://<devportal-host>:9443/devportal/applications/{applicationUUID}/subscript
 
 [ ] Register webhook endpoint in Stripe Dashboard:
       URL: https://<host>:9443/api/am/stripe/webhook
-      Event: checkout.session.completed
+      Events:
+        - checkout.session.completed
+        - invoice.payment_failed
+        - customer.subscription.updated
 
 [ ] Restart WSO2 APIM
 ```
+
+### Stripe Test Cards
+
+| Card Number | Scenario |
+|---|---|
+| `4242 4242 4242 4242` | Payment succeeds immediately |
+| `4000 0000 0000 0341` | Card attaches successfully but all charges are declined — triggers `STRIPE_PAYMENT_DECLINED` path |
+| `4000 0025 0000 3151` | Requires 3D Secure authentication — subscription becomes `incomplete` |
+| `4000 0000 0000 9995` | Card always declined (insufficient funds) |
+
+Use any future expiry date (e.g. `12/34`) and any 3-digit CVC (e.g. `123`).
