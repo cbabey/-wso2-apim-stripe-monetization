@@ -56,8 +56,8 @@ import java.security.NoSuchAlgorithmException;
  *   <li>Pass the Stripe session ID via {@code workflowDTO.attributes} and call
  *       {@code WorkflowExecutor.complete()} — at runtime this dispatches to
  *       {@code StripeSubscriptionCreationWorkflowExecutor.complete()} from the
- *       stripe plugin bundle, which creates the platform customer, shared customer,
- *       and Stripe subscription.</li>
+ *       stripe plugin bundle, which retrieves the Stripe-created subscription from
+ *       the connected account, persists it, and activates the APIM subscription.</li>
  *   <li>Return HTTP 200 so Stripe does not retry.</li>
  * </ol>
  *

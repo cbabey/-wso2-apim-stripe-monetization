@@ -39,7 +39,8 @@
             <param-name>jaxrs.serviceClasses</param-name>
             <param-value>
                 org.wso2.apim.monetization.webhook.WebhookApi,
-                org.wso2.apim.monetization.webhook.CheckoutUrlApi
+                org.wso2.apim.monetization.webhook.CheckoutUrlApi,
+                org.wso2.apim.monetization.webhook.CompleteSessionApi
             </param-value>
         </init-param>
 

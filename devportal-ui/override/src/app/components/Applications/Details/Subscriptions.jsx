@@ -225,6 +225,7 @@ class Subscriptions extends React.Component {
         this.handleSubscriptionUpdate = this.handleSubscriptionUpdate.bind(this);
         this.updateSubscriptions = this.updateSubscriptions.bind(this);
         this.handleSubscribe = this.handleSubscribe.bind(this);
+        this.handleStripeSessionCompletion = this.handleStripeSessionCompletion.bind(this);
         this.handleOpenDialog = this.handleOpenDialog.bind(this);
         this.handleSearchTextChange = this.handleSearchTextChange.bind(this);
         this.handleSearchTextTmpChange = this.handleSearchTextTmpChange.bind(this);
@@ -241,6 +242,23 @@ class Subscriptions extends React.Component {
     componentDidMount() {
         const { applicationId } = this.props.application;
         this.updateSubscriptions(applicationId);
+
+        // Handle browser redirect back from Stripe Checkout success URL.
+        // Stripe appends ?session_id=cs_xxx to the success URL so we can complete
+        // the subscription activation immediately, without waiting for the webhook.
+        const params = new URLSearchParams(window.location.search);
+        const sessionId = params.get('session_id');
+        if (sessionId) {
+            // Strip session_id from the URL immediately to prevent double-processing
+            // if the user refreshes the page.
+            params.delete('session_id');
+            const newSearch = params.toString();
+            window.history.replaceState(
+                null, '',
+                window.location.pathname + (newSearch ? '?' + newSearch : ''),
+            );
+            this.handleStripeSessionCompletion(sessionId);
+        }
     }
 
     handleOpenDialog() {
@@ -486,6 +504,51 @@ class Subscriptions extends React.Component {
                         defaultMessage: 'Error occurred during subscription',
                     }));
                 }
+            });
+    }
+
+    /**
+     * Calls the stripe webapp complete-session endpoint after the user returns from
+     * Stripe Checkout. On success the subscription list is refreshed to show UNBLOCKED.
+     * The concurrent webhook path is protected by a DB-level idempotency guard so
+     * calling this at the same time as the webhook is always safe.
+     *
+     * @param {string} sessionId Stripe Checkout Session ID (cs_xxx)
+     */
+    handleStripeSessionCompletion(sessionId) {
+        const { intl } = this.props;
+        const { applicationId } = this.props.application;
+
+        fetch('/api/am/stripe/complete-session?session_id=' + encodeURIComponent(sessionId), {
+            method: 'POST',
+            credentials: 'include',
+        })
+            .then((response) => {
+                if (response.ok) {
+                    Alert.info(intl.formatMessage({
+                        id: 'Applications.Details.Subscriptions.stripe.payment.confirmed',
+                        defaultMessage: 'Payment confirmed! Your subscription is now active.',
+                    }));
+                    this.updateSubscriptions(applicationId);
+                    this.props.getApplication();
+                } else {
+                    response.json().then((body) => {
+                        console.error('Stripe session completion failed:', body);
+                    }).catch(() => {});
+                    Alert.error(intl.formatMessage({
+                        id: 'Applications.Details.Subscriptions.stripe.payment.failed',
+                        defaultMessage: 'Payment confirmation failed. Please contact support if your '
+                            + 'subscription does not activate shortly.',
+                    }));
+                }
+            })
+            .catch((error) => {
+                console.error('Error completing Stripe session:', error);
+                Alert.error(intl.formatMessage({
+                    id: 'Applications.Details.Subscriptions.stripe.payment.error',
+                    defaultMessage: 'An error occurred while confirming your payment. '
+                        + 'Your subscription will activate automatically if payment was successful.',
+                }));
             });
     }
 
