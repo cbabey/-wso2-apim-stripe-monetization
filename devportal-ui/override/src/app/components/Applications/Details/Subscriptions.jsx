@@ -253,6 +253,10 @@ class Subscriptions extends React.Component {
         const searchParams = new URLSearchParams(window.location.search);
         const sessionId = searchParams.get('session_id');
         if (sessionId && sessionId.startsWith('cs_')) {
+            // Remove session_id from the URL immediately — before the async fetch —
+            // so that React 18 StrictMode's double-mount (or a manual refresh) does
+            // not re-trigger the complete-session call a second time.
+            window.history.replaceState({}, document.title, window.location.pathname);
             this.handleStripeSessionCompletion(sessionId);
         }
     }
@@ -272,8 +276,6 @@ class Subscriptions extends React.Component {
             method: 'POST',
         })
             .then((res) => {
-                // Remove session_id from URL so a page refresh does not re-trigger this flow
-                window.history.replaceState({}, document.title, window.location.pathname);
                 if (res.ok) {
                     const { applicationId } = this.props.application;
                     this.updateSubscriptions(applicationId);

@@ -31,6 +31,7 @@ import com.stripe.model.Token;
 import com.stripe.model.checkout.Session;
 import com.stripe.param.checkout.SessionCreateParams;
 import com.stripe.net.RequestOptions;
+import com.stripe.service.CheckoutService;
 import org.apache.commons.collections.MapUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
