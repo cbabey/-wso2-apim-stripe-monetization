@@ -132,7 +132,6 @@ public class StripeMonetizationConstants {
     public static final String SUCCESSFULL = "SUCCESSFULL";
     public static final String UNSUCCESSFULL = "UNSUCCESSFULL";
     public static final String FILE_SEPERATOR = "/";
-    public static final String DEFAULT_TOKEN = "tok_visa";
 
     // Key used in WorkflowDTO.attributes to pass the Stripe session ID from the
     // webhook webapp to StripeSubscriptionCreationWorkflowExecutor.complete()
