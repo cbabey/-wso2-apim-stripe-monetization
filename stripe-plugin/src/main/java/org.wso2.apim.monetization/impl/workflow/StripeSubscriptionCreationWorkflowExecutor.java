@@ -204,9 +204,12 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
             int apiId = ApiMgtDAO.getInstance().getAPIID(api.getUuid(), con);
             priceId = stripeMonetizationDAO.getBillingEnginePlanIdForTier(
                     apiId, subWorkFlowDTO.getTierName());
-        } catch (SQLException e) {
+        } catch (APIManagementException e) {
             throw new WorkflowException(
                     "Failed to retrieve API DB ID for UUID: " + api.getUuid(), e);
+        } catch (SQLException e) {
+            throw new WorkflowException(
+                    "DB connection error resolving API ID for UUID: " + api.getUuid(), e);
         } catch (StripeMonetizationException e) {
             throw new WorkflowException(
                     "Failed to retrieve billing plan for tier: " + subWorkFlowDTO.getTierName(), e);
@@ -600,10 +603,6 @@ public class StripeSubscriptionCreationWorkflowExecutor extends WorkflowExecutor
         } catch (StripeException e) {
             throw new WorkflowException(
                     "Stripe API error during checkout completion for session: "
-                    + checkoutSessionId, e);
-        } catch (APIManagementException e) {
-            throw new WorkflowException(
-                    "APIM error during checkout completion for session: "
                     + checkoutSessionId, e);
         } catch (StripeMonetizationException e) {
             throw new WorkflowException(

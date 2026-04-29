@@ -157,6 +157,7 @@ public class StripeMonetizationConstants {
 
     // Stripe Checkout Session — DB status values
     public static final String CHECKOUT_SESSION_STATUS_PENDING = "PENDING";
+    public static final String CHECKOUT_SESSION_STATUS_IN_PROGRESS = "IN_PROGRESS";
     public static final String CHECKOUT_SESSION_STATUS_COMPLETED = "COMPLETED";
     public static final String CHECKOUT_SESSION_STATUS_EXPIRED = "EXPIRED";
 
@@ -189,6 +190,23 @@ public class StripeMonetizationConstants {
     public static final String GET_CHECKOUT_URL_BY_WORKFLOW_REF_SQL =
             "SELECT CHECKOUT_URL FROM AM_STRIPE_CHECKOUT_SESSIONS " +
             "WHERE WORKFLOW_REFERENCE = ? AND STATUS = 'PENDING'";
+
+    /**
+     * Atomically transitions a checkout session from PENDING to IN_PROGRESS.
+     * Returns rowsAffected == 1 if the caller won the claim; 0 if another path
+     * already claimed or completed the session.
+     */
+    public static final String CLAIM_CHECKOUT_SESSION_SQL =
+            "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'IN_PROGRESS' " +
+            "WHERE SESSION_ID = ? AND STATUS = 'PENDING'";
+
+    /**
+     * Resets a session from IN_PROGRESS back to PENDING so the other concurrent
+     * path can retry after a transient error in the claiming path.
+     */
+    public static final String RESET_CHECKOUT_SESSION_CLAIM_SQL =
+            "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'PENDING' " +
+            "WHERE SESSION_ID = ? AND STATUS = 'IN_PROGRESS'";
     public static final String INVOICE_NOW = "invoice_now";
     public static final String CANCELED = "canceled";
     public static final String ANALYTICS_ACCESS_TOKEN_PROP = "Monetization.UsagePublisher.AnalyticsAccessToken";
