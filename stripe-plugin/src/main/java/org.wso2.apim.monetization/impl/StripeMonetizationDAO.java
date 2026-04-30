@@ -992,6 +992,49 @@ public class StripeMonetizationDAO {
      *         {@code false} if another path already claimed or completed it
      * @throws StripeMonetizationException if the DB update fails
      */
+    /**
+     * Returns the Stripe shared customer ID, tenant ID, and an API UUID for the most recent
+     * active subscription under the given Dev Portal application UUID.
+     *
+     * <p>Used by {@code StripeBillingPortalService} to identify which Stripe customer to open
+     * the Customer Portal for. {@code LIMIT 1 ORDER BY sc.ID DESC} selects the most recent
+     * shared customer so stale entries from earlier subscriptions are not used.
+     *
+     * @param applicationUUID Dev Portal application UUID (from AM_APPLICATION.UUID)
+     * @return {@code String[]{sharedCustomerId, tenantId, apiUuid}} or {@code null} if no
+     *         active Stripe subscription exists for this application
+     * @throws StripeMonetizationException if the DB query fails
+     */
+    public String[] getSharedCustomerAndApiByApplicationUUID(String applicationUUID)
+            throws StripeMonetizationException {
+
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        try {
+            conn = APIMgtDBUtil.getConnection();
+            ps = conn.prepareStatement(
+                    StripeMonetizationConstants.GET_SHARED_CUSTOMER_AND_API_BY_APP_UUID_SQL);
+            ps.setString(1, applicationUUID);
+            rs = ps.executeQuery();
+            if (rs.next()) {
+                return new String[]{
+                        rs.getString("STRIPE_CUSTOMER_ID"),
+                        String.valueOf(rs.getInt("TENANT_ID")),
+                        rs.getString("API_UUID")
+                };
+            }
+            return null;
+        } catch (SQLException e) {
+            String errorMessage = "Error while looking up shared Stripe customer "
+                    + "for application UUID: " + applicationUUID;
+            log.error(errorMessage, e);
+            throw new StripeMonetizationException(errorMessage, e);
+        } finally {
+            APIMgtDBUtil.closeAllConnections(ps, conn, rs);
+        }
+    }
+
     public boolean claimCheckoutSession(String sessionId) throws StripeMonetizationException {
 
         Connection conn = null;

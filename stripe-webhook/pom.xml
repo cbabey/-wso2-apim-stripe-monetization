@@ -53,6 +53,14 @@
             <version>3.3.6</version>
         </dependency>
 
+        <!-- ── Stripe monetization plugin (provided by the Carbon server OSGi runtime) ── -->
+        <dependency>
+            <groupId>org.wso2.apim.monetization</groupId>
+            <artifactId>org.wso2.apim.monetization.impl</artifactId>
+            <version>1.4.1</version>
+            <scope>provided</scope>
+        </dependency>
+
         <!-- ── APIM / Carbon APIs (provided by the Carbon server) ──────────── -->
         <dependency>
             <groupId>org.wso2.carbon.apimgt</groupId>

@@ -207,6 +207,18 @@ public class StripeMonetizationConstants {
     public static final String RESET_CHECKOUT_SESSION_CLAIM_SQL =
             "UPDATE AM_STRIPE_CHECKOUT_SESSIONS SET STATUS = 'PENDING' " +
             "WHERE SESSION_ID = ? AND STATUS = 'IN_PROGRESS'";
+    public static final String GET_SHARED_CUSTOMER_AND_API_BY_APP_UUID_SQL =
+            "SELECT sc.SHARED_CUSTOMER_ID AS STRIPE_CUSTOMER_ID, sc.TENANT_ID, api.API_UUID " +
+            "FROM AM_MONETIZATION_SHARED_CUSTOMERS sc " +
+            "JOIN AM_APPLICATION app ON app.APPLICATION_ID = sc.APPLICATION_ID " +
+            "JOIN AM_MONETIZATION_SUBSCRIPTIONS ms " +
+            "  ON ms.SUBSCRIBED_APPLICATION_ID = sc.APPLICATION_ID " +
+            "  AND ms.SHARED_CUSTOMER_ID = sc.ID " +
+            "JOIN AM_API api ON api.API_ID = ms.SUBSCRIBED_API_ID " +
+            "WHERE app.UUID = ? " +
+            "ORDER BY sc.ID DESC " +
+            "LIMIT 1";
+
     public static final String INVOICE_NOW = "invoice_now";
     public static final String CANCELED = "canceled";
     public static final String ANALYTICS_ACCESS_TOKEN_PROP = "Monetization.UsagePublisher.AnalyticsAccessToken";
